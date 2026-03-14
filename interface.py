@@ -54,6 +54,26 @@ def _load_ticker_options():
 tickers = _load_ticker_options()
 
 
+def _load_similarity_map() -> Dict[str, List[Dict[str, object]]]:
+    similarity_path = os.path.join(os.path.dirname(__file__) or ".", "autoencoder_similar_stocks.json")
+    if not os.path.isfile(similarity_path):
+        return {}
+    try:
+        with open(similarity_path, "r", encoding="utf-8") as handle:
+            raw = json.load(handle)
+        return {
+            str(symbol).upper(): neighbors
+            for symbol, neighbors in raw.items()
+            if isinstance(neighbors, list)
+        }
+    except Exception as e:
+        print(f"Error loading similarity map: {e}")
+        return {}
+
+
+SIMILARITY_MAP = _load_similarity_map()
+
+
 TIMEFRAMES = [
     ("1D", "1d"), ("5D", "5d"), ("1M", "1mo"), ("6M", "6mo"), ("1Y", "1y"), ("5Y", "5y"), ("Max", "max")
 ]
@@ -340,6 +360,10 @@ app.layout = html.Div(
                 ], style=CARD_STYLE),
                 dcc.Store(id="promising-store", data=None),
                 html.Div([
+                    html.H3("Most Similar Stocks", style={"marginTop": 0}),
+                    html.Div(id="similar-stocks"),
+                ], style=CARD_STYLE),
+                html.Div([
                     html.H3("Within 10% of 200-week MA", style={"marginTop": 0}),
                     html.Div(id="near-200w-ma"),
                 ], style=CARD_STYLE),
@@ -456,6 +480,61 @@ def build_promising_panel(ticker_list):
         for t in ticker_list
     ], style={"display": "grid", "gap": 4, "maxHeight": 280, "overflowY": "auto"})
 
+
+@app.callback(
+    Output("similar-stocks", "children"),
+    Input("ticker", "value"),
+    prevent_initial_call=False,
+)
+def build_similar_stocks_panel(symbol: str):
+    if not symbol:
+        return html.Div("Select a ticker to view similar stocks.", style={"color": "#777"})
+
+    neighbors = SIMILARITY_MAP.get(str(symbol).upper(), [])[:10]
+    if not neighbors:
+        return html.Div("No autoencoder similarity data available for this ticker.", style={"color": "#777"})
+
+    btn_style = {
+        "display": "flex",
+        "justifyContent": "space-between",
+        "alignItems": "center",
+        "width": "100%",
+        "textAlign": "left",
+        "marginBottom": 4,
+        "cursor": "pointer",
+        "padding": "6px 8px",
+        "border": "1px solid #e0e0e0",
+        "borderRadius": 4,
+        "background": "#fafafa",
+        "gap": 8,
+    }
+    return html.Div([
+        html.Button(
+            [
+                html.Span(neighbor.get("ticker", "—"), style={"fontWeight": 600}),
+                html.Span(
+                    f"L2 distance: {float(neighbor.get('distance', 0.0)):.4f}",
+                    style={"color": "#666", "fontSize": 12},
+                ),
+            ],
+            id={"type": "ticker-select-similar", "index": neighbor.get("ticker", "")},
+            style=btn_style,
+        )
+        for neighbor in neighbors
+        if neighbor.get("ticker")
+    ], style={"display": "grid", "gap": 4, "maxHeight": 320, "overflowY": "auto"})
+
+
+def _has_real_click(value) -> bool:
+    if isinstance(value, (list, tuple)):
+        return any(_has_real_click(item) for item in value)
+    if value is None:
+        return False
+    try:
+        return float(value) > 0
+    except (TypeError, ValueError):
+        return False
+
 # Poll cache file; only update Store when content actually changes (avoids re-mounting buttons every 5s)
 @app.callback(
     Output("near-200w-store", "data"),
@@ -547,12 +626,15 @@ def build_below_50w_panel(ticker_list):
 @app.callback(
     Output("ticker", "value", allow_duplicate=True),
     Input({"type": "ticker-select-promising", "index": ALL}, "n_clicks"),
+    Input({"type": "ticker-select-similar", "index": ALL}, "n_clicks"),
     Input({"type": "ticker-select-near200w", "index": ALL}, "n_clicks"),
     Input({"type": "ticker-select-below50w", "index": ALL}, "n_clicks"),
     prevent_initial_call=True,
 )
-def set_ticker_from_panel(_promising_clicks, _near200w_clicks, _below50w_clicks):
-    if not ctx.triggered_id:
+def set_ticker_from_panel(_promising_clicks, _similar_clicks, _near200w_clicks, _below50w_clicks):
+    if not ctx.triggered_id or not ctx.triggered:
+        return dash.no_update
+    if not _has_real_click(ctx.triggered[0].get("value")):
         return dash.no_update
     return ctx.triggered_id["index"]
 
