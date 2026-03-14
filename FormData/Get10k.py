@@ -97,5 +97,11 @@ def extract_10k_section(full_text: str, key: str) -> str:
 
 # ------------------ Example usage ------------------
 if __name__ == "__main__":
-    text = get_latest_10k_text("ABCL")
+    import os
+    ticker = "ABCL" 
+    text = get_latest_10k_text(ticker)
+    # save the text to a folder directory called 10k_text
+    os.makedirs("10k_text", exist_ok=True)
+    with open(f"10k_text/{ticker}.txt", "w", encoding="utf-8") as f:
+        f.write(text)
     print(text[:2000])

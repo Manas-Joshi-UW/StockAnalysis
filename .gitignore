@@ -3,3 +3,8 @@ promising_stocks.csv
 .venv/
 adj_close_wide.csv
 UI.png
+.env
+.near_200w_ma_cache.json
+.near_200w_ma_computing.lock
+.below_50w_ma_cache.json
+.below_50w_ma_computing.lock

@@ -12,17 +12,17 @@
 # ------------------------------------------------------------
 
 from __future__ import annotations
-import pandas as pd
+import json
+import os
+import threading
+from datetime import datetime, timedelta
 from typing import List, Dict, Optional
 
-from dash import (
-    Dash, dcc, html, Input, Output, State
-)
-import plotly.graph_objects as go
-import os
-import datetime
-from datetime import datetime, timedelta
+import pandas as pd
 import yfinance as yf
+import plotly.graph_objects as go
+from dash import Dash, dcc, html, Input, Output, State, ctx, ALL
+import dash
 
 # ------------------------------------------------------------
 # App setup
@@ -36,12 +36,36 @@ DEFAULT_TICKERS = [
     {"label": "Advanced Micro Devices (AMD)", "value": "AMD"},
 ]
 
-tickers = [f.name.replace('.parquet', '') for f in os.scandir("price_history") if f.is_file()]
+def _load_ticker_options():
+    parquet_dir = "price_history"
+    parquet_tickers = []
+    if os.path.isdir(parquet_dir):
+        parquet_tickers = [f.name.replace(".parquet", "") for f in os.scandir(parquet_dir) if f.is_file()]
+    promising = []
+    csv_path = os.path.join(os.path.dirname(__file__) or ".", "promising_stocks.csv")
+    if os.path.isfile(csv_path):
+        try:
+            df = pd.read_csv(csv_path)
+            promising = df["ticker"].dropna().astype(str).str.strip().tolist()
+        except Exception:
+            pass
+    return sorted(set(parquet_tickers) | set(promising))
+
+tickers = _load_ticker_options()
 
 
 TIMEFRAMES = [
     ("1D", "1d"), ("5D", "5d"), ("1M", "1mo"), ("6M", "6mo"), ("1Y", "1y"), ("5Y", "5y"), ("Max", "max")
 ]
+
+# Moving average options: (label, value, rolling window in trading days)
+MA_OPTIONS = [
+    ("50-day MA", "ma_50d", 50),
+    ("200-day MA", "ma_200d", 200),
+    ("50-week MA", "ma_50w", 250),   # ~50 * 5 trading days
+    ("200-week MA", "ma_200w", 1000), # ~200 * 5
+]
+MA_MAP = {v: (label, window) for label, v, window in MA_OPTIONS}
 
 # Inline styles (replacement for the removed <style> block)
 CARD_STYLE = {
@@ -139,7 +163,12 @@ def extra_info_in_title(df_price: pd.DataFrame) -> Dict[str, str]:
 
 
 
-def make_price_figure(df: Optional[pd.DataFrame], symbol: str, timeframe_label: str) -> go.Figure:
+def make_price_figure(
+    df: Optional[pd.DataFrame],
+    symbol: str,
+    timeframe_label: str,
+    selected_ma: Optional[List[str]] = None,
+) -> go.Figure:
     fig = go.Figure()
     print("We are making the price figure")
     try:
@@ -203,10 +232,22 @@ def make_price_figure(df: Optional[pd.DataFrame], symbol: str, timeframe_label: 
         fig.add_trace(go.Bar(x=df.index, y=df[cols["volume"]], name="Volume", yaxis="y2", opacity=0.2))
         fig.update_layout(yaxis2=dict(overlaying="y", side="right", showgrid=False))
 
+    # Moving averages (daily data only; need enough bars)
+    close_col = cols.get("close") or cols.get("adj close")
+    if close_col and selected_ma:
+        close = df[close_col]
+        for ma_key in selected_ma:
+            if ma_key not in MA_MAP:
+                continue
+            label, window = MA_MAP[ma_key]
+            if len(close) < window:
+                continue
+            ma_series = close.rolling(window, min_periods=window).mean()
+            fig.add_trace(go.Scatter(x=df.index, y=ma_series, name=label, mode="lines"))
+
     # Get extra info for title
     extra_info = extra_info_in_title(df)
-    # Remove legend from the figure
-    fig.update_layout(showlegend=False)
+    fig.update_layout(showlegend=bool(selected_ma))
     
     # Build title with extra info
     title_parts = [f"{symbol} — {timeframe_label}"]
@@ -224,6 +265,16 @@ def make_price_figure(df: Optional[pd.DataFrame], symbol: str, timeframe_label: 
         xaxis_title=None, yaxis_title=None,
         title=title
     )
+
+    # Hide non-trading gaps for intraday views (1D / 5D)
+    if timeframe_label in ("1D", "5D"):
+        fig.update_xaxes(
+            rangebreaks=[
+                dict(bounds=["sat", "mon"]),           # weekends
+                dict(bounds=[16, 9.5], pattern="hour"), # overnight
+            ]
+        )
+
     return fig
 
 # ------------------------------------------------------------
@@ -250,6 +301,18 @@ app.layout = html.Div(
             ), style={"flex": 1, "textAlign": "right"}),
         ], style={"display": "flex", "gap": 12, "alignItems": "center", "marginBottom": 8}),
 
+        # Moving averages checklist
+        html.Div([
+            html.Span("Moving averages: ", style={"marginRight": 8, "color": "#666"}),
+            dcc.Checklist(
+                id="ma-checklist",
+                options=[{"label": lab, "value": val} for lab, val, _ in MA_OPTIONS],
+                value=[],
+                inline=True,
+                labelStyle={"display": "inline-block", "marginRight": 16},
+            ),
+        ], style={"marginBottom": 8}),
+
         # Main grid
         html.Div([
             # Left: chart + company snapshot
@@ -269,16 +332,25 @@ app.layout = html.Div(
                 ], style=CARD_STYLE),
             ], style={"display": "grid", "gap": 12}),
 
-            # Right: trending panels
+            # Right: promising stocks + near 200w MA
             html.Div([
                 html.Div([
-                    html.H3("Trending on X (last 24h)", style={"marginTop": 0}),
-                    html.Div(id="trending-x"),
+                    html.H3("Promising stocks", style={"marginTop": 0}),
+                    html.Div(id="promising-stocks"),
+                ], style=CARD_STYLE),
+                dcc.Store(id="promising-store", data=None),
+                html.Div([
+                    html.H3("Within 10% of 200-week MA", style={"marginTop": 0}),
+                    html.Div(id="near-200w-ma"),
                 ], style=CARD_STYLE),
                 html.Div([
-                    html.H3("Trending on r/wallstreetbets (24–48h)", style={"marginTop": 0}),
-                    html.Div(id="trending-wsb"),
+                    html.H3("Below 50-week MA", style={"marginTop": 0}),
+                    html.Div(id="below-50w-ma"),
                 ], style=CARD_STYLE),
+                dcc.Store(id="near-200w-store", data=None),
+                dcc.Store(id="below-50w-store", data=None),
+                dcc.Interval(id="interval-near200w", interval=5_000, n_intervals=0),
+                dcc.Interval(id="interval-below50w", interval=5_000, n_intervals=0),
             ], style={"minWidth": 340, "display": "grid", "gap": 12}),
         ], style={"display": "grid", "gridTemplateColumns": "1fr 360px", "gap": 12}),
     ], style={"maxWidth": 1200, "margin": "0 auto", "padding": 14})
@@ -291,19 +363,20 @@ app.layout = html.Div(
     Output("price-chart", "figure"),
     Input("ticker", "value"),
     Input("timeframe", "value"),
+    Input("ma-checklist", "value"),
     prevent_initial_call=False,
 )
-def update_chart(symbol: str, timeframe: str):
+def update_chart(symbol: str, timeframe: str, selected_ma: Optional[List[str]]):
     if not symbol:
-        return make_price_figure(None, "—", "—")
+        return make_price_figure(None, "—", "—", selected_ma=selected_ma or [])
     
     label = next((lab for lab, val in TIMEFRAMES if val == timeframe), timeframe)
     try:
-        df = get_price_df(symbol, timeframe)  # <-- implement
+        df = get_price_df(symbol, timeframe)
     except Exception as e:
         print(f"Error loading data for {symbol}: {e}")
         df = None
-    return make_price_figure(df, symbol, label)
+    return make_price_figure(df, symbol, label, selected_ma=selected_ma or [])
 
 
 @app.callback(
@@ -355,185 +428,293 @@ def update_company_info(symbol: str):
     )
 
 
+# Load promising tickers into Store once (so panel doesn't re-render on every ticker change)
 @app.callback(
-    Output("trending-x", "children"),
-    Input("price-chart", "figure"),
+    Output("promising-store", "data"),
+    Input("ticker", "value"),
+    State("promising-store", "data"),
+    prevent_initial_call=False,
 )
-def update_trending_x(_):
+def fill_promising_store(_ticker, current):
+    if current is not None:
+        return dash.no_update
+    return get_promising_tickers()
+
+
+# Build promising-stocks panel from Store (renders once when Store is filled)
+@app.callback(
+    Output("promising-stocks", "children"),
+    Input("promising-store", "data"),
+    prevent_initial_call=False,
+)
+def build_promising_panel(ticker_list):
+    if not ticker_list:
+        return html.Div("No promising_stocks.csv or empty.", style={"color": "#777"})
+    btn_style = {"display": "block", "width": "100%", "textAlign": "left", "marginBottom": 4, "cursor": "pointer", "padding": "6px 8px", "border": "1px solid #e0e0e0", "borderRadius": 4, "background": "#fafafa"}
+    return html.Div([
+        html.Button(t, id={"type": "ticker-select-promising", "index": t}, style=btn_style)
+        for t in ticker_list
+    ], style={"display": "grid", "gap": 4, "maxHeight": 280, "overflowY": "auto"})
+
+# Poll cache file; only update Store when content actually changes (avoids re-mounting buttons every 5s)
+@app.callback(
+    Output("near-200w-store", "data"),
+    Input("ticker", "value"),
+    Input("interval-near200w", "n_intervals"),
+    State("near-200w-store", "data"),
+    prevent_initial_call=False,
+)
+def update_near_200w_store(_ticker, _n_intervals, current_list):
+    if not os.path.isfile(_NEAR_200W_CACHE_FILE):
+        if not os.path.isfile(_NEAR_200W_LOCK_FILE):
+            try:
+                open(_NEAR_200W_LOCK_FILE, "w").close()
+                t = threading.Thread(target=_compute_near_200w_ma_to_cache, daemon=True)
+                t.start()
+            except Exception:
+                pass
+        return dash.no_update
     try:
-        items = get_trending_x()  # <-- implement
+        with open(_NEAR_200W_CACHE_FILE) as f:
+            new_list = json.load(f)
+        if new_list != current_list:
+            return new_list
     except Exception:
-        items = None
+        pass
+    return dash.no_update
 
-    if not items:
-        return html.Div(
-            "Connect your X data in get_trending_x(...).",
-            style={"color": "#777"}
-        )
 
-    # items: List[{symbol, name?, mentions?, sentiment?, changePct?}]
-    rows = []
-    for i, it in enumerate(items[:10], start=1):
-        sym = it.get("symbol")
-        name = it.get("name") or sym
-        m = it.get("mentions")
-        s = it.get("sentiment")
-        ch = it.get("changePct")
-        meta_bits = []
-        if m is not None: meta_bits.append(f"mentions: {m}")
-        if s is not None: meta_bits.append(f"sentiment: {s:+.2f}")
-        if ch is not None: meta_bits.append(f"Δ {ch:+.1f}%")
-        rows.append(html.Div(f"#{i} {sym} — {name}  {'  |  '.join(meta_bits)}"))
-    return html.Div(rows, style={"display": "grid", "gap": 6})
+# Build near-200w MA panel from Store (only re-renders when Store changes)
+@app.callback(
+    Output("near-200w-ma", "children"),
+    Input("near-200w-store", "data"),
+    prevent_initial_call=False,
+)
+def build_near_200w_panel(ticker_list):
+    if not ticker_list:
+        return html.Div("Computing in background…", style={"color": "#777"})
+    btn_style = {"display": "block", "width": "100%", "textAlign": "left", "marginBottom": 4, "cursor": "pointer", "padding": "6px 8px", "border": "1px solid #e0e0e0", "borderRadius": 4, "background": "#fafafa"}
+    return html.Div([
+        html.Button(t, id={"type": "ticker-select-near200w", "index": t}, style=btn_style)
+        for t in ticker_list
+    ], style={"display": "grid", "gap": 4, "maxHeight": 280, "overflowY": "auto"})
+
+
+# Poll cache for below-50w MA list; update Store only when content changes
+@app.callback(
+    Output("below-50w-store", "data"),
+    Input("ticker", "value"),
+    Input("interval-below50w", "n_intervals"),
+    State("below-50w-store", "data"),
+    prevent_initial_call=False,
+)
+def update_below_50w_store(_ticker, _n_intervals, current_list):
+    if not os.path.isfile(_BELOW_50W_CACHE_FILE):
+        if not os.path.isfile(_BELOW_50W_LOCK_FILE):
+            try:
+                open(_BELOW_50W_LOCK_FILE, "w").close()
+                t = threading.Thread(target=_compute_below_50w_ma_to_cache, daemon=True)
+                t.start()
+            except Exception:
+                pass
+        return dash.no_update
+    try:
+        with open(_BELOW_50W_CACHE_FILE) as f:
+            new_list = json.load(f)
+        if new_list != current_list:
+            return new_list
+    except Exception:
+        pass
+    return dash.no_update
 
 
 @app.callback(
-    Output("trending-wsb", "children"),
-    Input("price-chart", "figure"),
+    Output("below-50w-ma", "children"),
+    Input("below-50w-store", "data"),
+    prevent_initial_call=False,
 )
-def update_trending_wsb(_):
-    try:
-        items = get_trending_wsb()  # <-- implement
-    except Exception:
-        items = None
+def build_below_50w_panel(ticker_list):
+    if not ticker_list:
+        return html.Div("Computing in background…", style={"color": "#777"})
+    btn_style = {"display": "block", "width": "100%", "textAlign": "left", "marginBottom": 4, "cursor": "pointer", "padding": "6px 8px", "border": "1px solid #e0e0e0", "borderRadius": 4, "background": "#fafafa"}
+    return html.Div([
+        html.Button(t, id={"type": "ticker-select-below50w", "index": t}, style=btn_style)
+        for t in ticker_list
+    ], style={"display": "grid", "gap": 4, "maxHeight": 280, "overflowY": "auto"})
 
-    if not items:
-        return html.Div(
-            "Connect your Reddit data in get_trending_wsb(...).",
-            style={"color": "#777"}
-        )
 
-    rows = []
-    for it in items[:10]:
-        sym = it.get("symbol")
-        name = it.get("name") or sym
-        m = it.get("mentions")
-        s = it.get("sentiment")
-        ch = it.get("changePct")
-        bits = [name]
-        if m is not None: bits.append(f"mentions: {m}")
-        if s is not None: bits.append(f"sentiment: {s:+.2f}")
-        if ch is not None: bits.append(f"Δ {ch:+.1f}%")
-        rows.append(html.Div(f"{sym} — {'  |  '.join(bits)}"))
-    return html.Div(rows, style={"display": "grid", "gap": 6})
+# Clicking a ticker in any panel updates the dropdown (and thus the chart)
+@app.callback(
+    Output("ticker", "value", allow_duplicate=True),
+    Input({"type": "ticker-select-promising", "index": ALL}, "n_clicks"),
+    Input({"type": "ticker-select-near200w", "index": ALL}, "n_clicks"),
+    Input({"type": "ticker-select-below50w", "index": ALL}, "n_clicks"),
+    prevent_initial_call=True,
+)
+def set_ticker_from_panel(_promising_clicks, _near200w_clicks, _below50w_clicks):
+    if not ctx.triggered_id:
+        return dash.no_update
+    return ctx.triggered_id["index"]
 
 # ------------------------------------------------------------
 # YOUR DATA FUNCTIONS — replace these stubs
 # ------------------------------------------------------------
 
 PRICE_HISTORY_DIR = "price_history"
+_NEAR_200W_CACHE_FILE = os.path.join(os.path.dirname(__file__) or ".", ".near_200w_ma_cache.json")
+_NEAR_200W_LOCK_FILE = os.path.join(os.path.dirname(__file__) or ".", ".near_200w_ma_computing.lock")
+_BELOW_50W_CACHE_FILE = os.path.join(os.path.dirname(__file__) or ".", ".below_50w_ma_cache.json")
+_BELOW_50W_LOCK_FILE = os.path.join(os.path.dirname(__file__) or ".", ".below_50w_ma_computing.lock")
+
+# Timeframe cutoffs in days for parquet-based lookups
+_TF_DAYS = {"1mo": 30, "6mo": 180, "1y": 365, "5y": 1825}
+
+
+def _compute_near_200w_ma_to_cache():
+    """Run in background: compute get_tickers_near_200w_ma() and write list to cache file."""
+    try:
+        tickers = get_tickers_near_200w_ma()
+        with open(_NEAR_200W_CACHE_FILE, "w") as f:
+            json.dump(tickers, f)
+    except Exception:
+        pass
+    finally:
+        if os.path.isfile(_NEAR_200W_LOCK_FILE):
+            try:
+                os.remove(_NEAR_200W_LOCK_FILE)
+            except Exception:
+                pass
+
+
+def _compute_below_50w_ma_to_cache():
+    """Run in background: compute get_tickers_below_50w_ma() and write list to cache file."""
+    try:
+        tickers = get_tickers_below_50w_ma()
+        with open(_BELOW_50W_CACHE_FILE, "w") as f:
+            json.dump(tickers, f)
+    except Exception:
+        pass
+    finally:
+        if os.path.isfile(_BELOW_50W_LOCK_FILE):
+            try:
+                os.remove(_BELOW_50W_LOCK_FILE)
+            except Exception:
+                pass
+
+
+def _normalize_df(df: pd.DataFrame) -> pd.DataFrame:
+    """Strip MultiIndex columns and convert index to naive ET datetimes."""
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = df.columns.droplevel(1)
+    if df.index.tz is not None:
+        # Convert to ET then strip tz — keeps wall-clock hours aligned
+        # so rangebreaks at [16, 9.5] work correctly
+        df.index = df.index.tz_convert("America/New_York").tz_localize(None)
+    return df
 
 
 def update_parquet_if_stale(symbol: str) -> bool:
     """
-    Check the latest date in the parquet file and append any missing days from yfinance.
-    Returns True if successful, False on error.
+    Check the latest date in the parquet file and append any missing
+    daily bars from yfinance.  Returns True on success / no-op.
     """
-    parquet_path = f"{PRICE_HISTORY_DIR}/{symbol}.parquet"
+    parquet_path = os.path.join(PRICE_HISTORY_DIR, f"{symbol}.parquet")
     today = datetime.now().date()
-    
+
     try:
         df_existing = pd.read_parquet(parquet_path)
     except FileNotFoundError:
-        return False  # No file to update
+        return False
     except Exception as e:
         print(f"[{symbol}] Error reading parquet: {e}")
         return False
-    
-    # Get the latest date in existing data
+
+    df_existing = _normalize_df(df_existing)
     latest_date = pd.Timestamp(df_existing.index[-1]).date()
-    
-    # If already up to date, skip
+
     if latest_date >= today:
-        return True
-    
-    # Fetch missing days (start from day after latest)
+        return True  # already current
+
     start_date = latest_date + timedelta(days=1)
-    
     try:
         df_new = yf.download(
             tickers=symbol,
             start=start_date.isoformat(),
-            end=today.isoformat(),
+            end=(today + timedelta(days=1)).isoformat(),
             interval="1d",
             auto_adjust=False,
             progress=False,
             threads=False,
         )
-        
         if df_new.empty:
-            return True  # No new data (e.g., weekend/holiday)
-        
-        # Handle MultiIndex columns from yfinance
-        if isinstance(df_new.columns, pd.MultiIndex):
-            df_new.columns = df_new.columns.droplevel(1)
-        
-        # Normalize timezones
-        if df_new.index.tz is not None:
-            df_new.index = df_new.index.tz_convert(None)
-        if df_existing.index.tz is not None:
-            df_existing.index = df_existing.index.tz_convert(None)
-        
-        # Append new data and save
+            return True  # no new trading days
+
+        df_new = _normalize_df(df_new)
+
         df_combined = pd.concat([df_existing, df_new])
-        df_combined = df_combined[~df_combined.index.duplicated(keep='last')]
+        df_combined = df_combined[~df_combined.index.duplicated(keep="last")]
         df_combined.sort_index(inplace=True)
         df_combined.to_parquet(parquet_path)
-        
-        print(f"[{symbol}] Added {len(df_new)} new rows")
+        print(f"[{symbol}] Appended {len(df_new)} new row(s)")
         return True
-        
     except Exception as e:
         print(f"[{symbol}] Error fetching updates: {e}")
         return False
 
 
+def _fetch_live_intraday(symbol: str, timeframe: str) -> Optional[pd.DataFrame]:
+    """
+    For 1D / 5D: pull intraday bars directly from yfinance.
+    Uses 1-minute bars for 1D, 5-minute bars for 5D.
+    """
+    interval = "1m" if timeframe == "1d" else "5m"
+    try:
+        df = yf.download(
+            tickers=symbol,
+            period=timeframe,
+            interval=interval,
+            auto_adjust=False,
+            progress=False,
+            threads=False,
+        )
+        if df.empty:
+            return None
+        return _normalize_df(df)
+    except Exception as e:
+        print(f"[{symbol}] Intraday fetch error: {e}")
+        return None
+
+
 def get_price_df(symbol: str, timeframe: str) -> Optional[pd.DataFrame]:
     """
-    Return a DataFrame indexed by datetime with columns like
-    [Open, High, Low, Close, Volume] (case-insensitive).
-    Reads from parquet files in price_history/ directory.
-    Automatically fetches missing data from yfinance if stale.
+    1D / 5D  → live intraday data from yfinance (minute/5-min bars).
+    1M+ / Max → daily bars from local parquet (auto-backfilled).
     """
-    # Check and update parquet if data is stale
+    # --- short-horizon: live intraday ---
+    if timeframe in ("1d", "5d"):
+        return _fetch_live_intraday(symbol, timeframe)
+
+    # --- longer horizon: parquet + backfill ---
     update_parquet_if_stale(symbol)
-    
+
+    parquet_path = os.path.join(PRICE_HISTORY_DIR, f"{symbol}.parquet")
     try:
-        df = pd.read_parquet(f"{PRICE_HISTORY_DIR}/{symbol}.parquet")
+        df = pd.read_parquet(parquet_path)
     except FileNotFoundError:
         print(f"Parquet file not found for {symbol}")
         return None
     except Exception as e:
         print(f"Error reading parquet for {symbol}: {e}")
         return None
-    
-    # Filter by timeframe
-    today = datetime.now().date()
-    try:
-        if timeframe == "1d":
-            df = df[df.index.date >= today - timedelta(days=1)]
-        elif timeframe == "5d":
-            df = df[df.index.date >= today - timedelta(days=5)]
-        elif timeframe == "1mo":
-            df = df[df.index.date >= today - timedelta(days=30)]
-        elif timeframe == "6mo":
-            df = df[df.index.date >= today - timedelta(days=180)]
-        elif timeframe == "1y":
-            df = df[df.index.date >= today - timedelta(days=365)]
-        elif timeframe == "5y":
-            df = df[df.index.date >= today - timedelta(days=1825)]
-        elif timeframe == "max":
-            pass  # Return all data
-        else:
-            raise ValueError(f"Invalid timeframe: {timeframe}")
-    except Exception as e:
-        print(f"Error filtering by timeframe: {e}")
-        return None
-    
-    # Handle timezone conversion if needed
-    if df.index.tz is not None:
-        df.index = df.index.tz_convert(None)
-    
+
+    df = _normalize_df(df)
+
+    days = _TF_DAYS.get(timeframe)
+    if days:
+        cutoff = datetime.now().date() - timedelta(days=days)
+        df = df[df.index.date >= cutoff]
+    # timeframe == "max" → return everything
+
     return df
 
 
@@ -549,16 +730,84 @@ def get_company_snapshot(symbol: str) -> Optional[Dict]:
     return info.info
 
 
-def get_trending_x() -> Optional[List[Dict]]:
-    """Return a list of dicts: {symbol, name?, mentions?, sentiment?, changePct?}."""
-    # TODO: implement.
-    return None
+def get_promising_tickers() -> List[str]:
+    """Tickers from promising_stocks.csv."""
+    csv_path = os.path.join(os.path.dirname(__file__) or ".", "promising_stocks.csv")
+    if not os.path.isfile(csv_path):
+        return []
+    try:
+        df = pd.read_csv(csv_path)
+        return df["ticker"].dropna().astype(str).str.strip().tolist()
+    except Exception:
+        return []
 
 
-def get_trending_wsb() -> Optional[List[Dict]]:
-    """Return a list of dicts: {symbol, name?, mentions?, sentiment?, changePct?}."""
-    # TODO: implement.
-    return None
+def get_tickers_near_200w_ma(pct_band: float = 0.10) -> List[str]:
+    """Tickers whose latest close is within pct_band of their 200-week (1000-day) MA.
+    Only includes stocks with at least 10 years of data (~2520 trading days).
+    """
+    out = []
+    ma_days = 1000
+    min_trading_days = 2520  # ~10 years
+    if not os.path.isdir(PRICE_HISTORY_DIR):
+        return out
+    for f in os.scandir(PRICE_HISTORY_DIR):
+        if not f.is_file() or not f.name.endswith(".parquet"):
+            continue
+        symbol = f.name.replace(".parquet", "")
+        try:
+            df = pd.read_parquet(f.path)
+            df = _normalize_df(df)
+            close_col = "Close" if "Close" in df.columns else "Adj Close"
+            if close_col not in df.columns or len(df) < ma_days:
+                continue
+            if len(df) < min_trading_days:
+                continue
+            close = df[close_col]
+            ma = close.rolling(ma_days, min_periods=ma_days).mean()
+            last_close = close.iloc[-1]
+            last_ma = ma.iloc[-1]
+            if pd.isna(last_ma) or last_ma <= 0:
+                continue
+            ratio = last_close / last_ma
+            if 1 - pct_band <= ratio <= 1 + pct_band:
+                out.append(symbol)
+        except Exception:
+            continue
+    return sorted(out)
+
+
+def get_tickers_below_50w_ma() -> List[str]:
+    """Tickers whose latest close is below their 50-week (250-day) MA.
+    Only includes stocks with at least 10 years of data (~2520 trading days).
+    """
+    out = []
+    ma_days = 250  # 50 weeks
+    min_trading_days = 2520
+    if not os.path.isdir(PRICE_HISTORY_DIR):
+        return out
+    for f in os.scandir(PRICE_HISTORY_DIR):
+        if not f.is_file() or not f.name.endswith(".parquet"):
+            continue
+        symbol = f.name.replace(".parquet", "")
+        try:
+            df = pd.read_parquet(f.path)
+            df = _normalize_df(df)
+            close_col = "Close" if "Close" in df.columns else "Adj Close"
+            if close_col not in df.columns or len(df) < ma_days or len(df) < min_trading_days:
+                continue
+            close = df[close_col]
+            ma = close.rolling(ma_days, min_periods=ma_days).mean()
+            last_close = close.iloc[-1]
+            last_ma = ma.iloc[-1]
+            if pd.isna(last_ma):
+                continue
+            if last_close < last_ma:
+                out.append(symbol)
+        except Exception:
+            continue
+    return sorted(out)
+
 
 # ------------------------------------------------------------
 # Main
