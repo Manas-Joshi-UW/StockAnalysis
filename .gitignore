@@ -8,3 +8,7 @@ UI.png
 .near_200w_ma_computing.lock
 .below_50w_ma_cache.json
 .below_50w_ma_computing.lock
+autoencoder_similar_stocks.json
+stock_embeddings.json
+stock_autoencoder.pt
+stock_autoencoder_metrics.json
