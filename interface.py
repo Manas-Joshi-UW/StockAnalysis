@@ -74,6 +74,15 @@ def _load_similarity_map() -> Dict[str, List[Dict[str, object]]]:
 SIMILARITY_MAP = _load_similarity_map()
 
 
+def _normalize_selected_symbols(symbol_value) -> List[str]:
+    if symbol_value is None:
+        return []
+    if isinstance(symbol_value, (list, tuple)):
+        return [str(symbol).strip().upper() for symbol in symbol_value if str(symbol).strip()]
+    symbol = str(symbol_value).strip()
+    return [symbol.upper()] if symbol else []
+
+
 TIMEFRAMES = [
     ("1D", "1d"), ("5D", "5d"), ("1M", "1mo"), ("6M", "6mo"), ("1Y", "1y"), ("5Y", "5y"), ("Max", "max")
 ]
@@ -297,6 +306,70 @@ def make_price_figure(
 
     return fig
 
+
+def make_comparison_figure(
+    price_frames: Dict[str, Optional[pd.DataFrame]],
+    timeframe_label: str,
+    normalize: bool = False,
+) -> go.Figure:
+    fig = go.Figure()
+    added_trace = False
+
+    for symbol, df in price_frames.items():
+        if df is None or df.empty:
+            continue
+        close_col = "Close" if "Close" in df.columns else "Adj Close" if "Adj Close" in df.columns else None
+        if close_col is None:
+            continue
+        series = pd.to_numeric(df[close_col], errors="coerce")
+        if normalize:
+            first_valid_index = series.first_valid_index()
+            if first_valid_index is None:
+                continue
+            base_price = series.loc[first_valid_index]
+            if not pd.notna(base_price) or abs(float(base_price)) < 1e-8:
+                continue
+            series = (series / float(base_price)) * 100.0
+        fig.add_trace(go.Scatter(
+            x=df.index,
+            y=series,
+            name=symbol,
+            mode="lines",
+        ))
+        added_trace = True
+
+    if not added_trace:
+        fig.update_layout(
+            annotations=[dict(
+                text="No closing-price data available for the selected comparison.",
+                x=0.5, y=0.5, xref="paper", yref="paper",
+                showarrow=False, font=dict(size=14, color="#888")
+            )],
+            margin=dict(l=10, r=10, t=30, b=10),
+            template="plotly_white",
+            title=f"{'Normalized ' if normalize else ''}Closing Price Comparison - {timeframe_label}"
+        )
+        return fig
+
+    fig.update_layout(
+        template="plotly_white",
+        margin=dict(l=10, r=10, t=30, b=10),
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+        xaxis_title=None,
+        yaxis_title="Normalized Close (Start = 100)" if normalize else "Close",
+        title=f"{'Normalized ' if normalize else ''}Closing Price Comparison - {timeframe_label}",
+    )
+
+    if timeframe_label in ("1D", "5D"):
+        fig.update_xaxes(
+            rangebreaks=[
+                dict(bounds=["sat", "mon"]),
+                dict(bounds=[16, 9.5], pattern="hour"),
+            ]
+        )
+
+    return fig
+
 # ------------------------------------------------------------
 # Layout
 # ------------------------------------------------------------
@@ -311,15 +384,16 @@ app.layout = html.Div(
 
         # Search row
         html.Div([
-            dcc.Dropdown(id="ticker", options=tickers, value="AAPL",
+            dcc.Dropdown(id="ticker", options=tickers, value=["AAPL"], multi=True,
                          placeholder="Search tickers or companies…", style={"flex": 1}),
             html.Div(dcc.RadioItems(
                 id="timeframe",
                 options=[{"label": lab, "value": val} for lab, val in TIMEFRAMES],
                 value="6mo",
+                inline=True,
                 labelStyle={"display": "inline-block", "marginRight": 10}
-            ), style={"flex": 1, "textAlign": "right"}),
-        ], style={"display": "flex", "gap": 12, "alignItems": "center", "marginBottom": 8}),
+            ), style={"width": "100%"}),
+        ], style={"display": "flex", "flexDirection": "column", "gap": 8, "marginBottom": 8}),
 
         # Moving averages checklist
         html.Div([
@@ -330,6 +404,16 @@ app.layout = html.Div(
                 value=[],
                 inline=True,
                 labelStyle={"display": "inline-block", "marginRight": 16},
+            ),
+        ], style={"marginBottom": 8}),
+
+        html.Div([
+            dcc.Checklist(
+                id="normalize-comparison",
+                options=[{"label": "Normalize comparison (start = 100)", "value": "normalize"}],
+                value=[],
+                inline=True,
+                labelStyle={"display": "inline-block", "marginRight": 16, "color": "#666"},
             ),
         ], style={"marginBottom": 8}),
 
@@ -362,7 +446,7 @@ app.layout = html.Div(
                 html.Div([
                     html.H3("Most Similar Stocks", style={"marginTop": 0}),
                     html.Div(id="similar-stocks"),
-                ], style=CARD_STYLE),
+                ], id="similar-stocks-card", style=CARD_STYLE),
                 html.Div([
                     html.H3("Within 10% of 200-week MA", style={"marginTop": 0}),
                     html.Div(id="near-200w-ma"),
@@ -388,19 +472,33 @@ app.layout = html.Div(
     Input("ticker", "value"),
     Input("timeframe", "value"),
     Input("ma-checklist", "value"),
+    Input("normalize-comparison", "value"),
     prevent_initial_call=False,
 )
-def update_chart(symbol: str, timeframe: str, selected_ma: Optional[List[str]]):
-    if not symbol:
+def update_chart(symbol: str, timeframe: str, selected_ma: Optional[List[str]], normalize_comparison: Optional[List[str]]):
+    symbols = _normalize_selected_symbols(symbol)
+    if not symbols:
         return make_price_figure(None, "—", "—", selected_ma=selected_ma or [])
     
     label = next((lab for lab, val in TIMEFRAMES if val == timeframe), timeframe)
+    if len(symbols) > 1:
+        normalize = "normalize" in (normalize_comparison or [])
+        price_frames = {}
+        for selected_symbol in symbols:
+            try:
+                price_frames[selected_symbol] = get_price_df(selected_symbol, timeframe)
+            except Exception as e:
+                print(f"Error loading data for {selected_symbol}: {e}")
+                price_frames[selected_symbol] = None
+        return make_comparison_figure(price_frames, label, normalize=normalize)
+
+    selected_symbol = symbols[0]
     try:
-        df = get_price_df(symbol, timeframe)
+        df = get_price_df(selected_symbol, timeframe)
     except Exception as e:
-        print(f"Error loading data for {symbol}: {e}")
+        print(f"Error loading data for {selected_symbol}: {e}")
         df = None
-    return make_price_figure(df, symbol, label, selected_ma=selected_ma or [])
+    return make_price_figure(df, selected_symbol, label, selected_ma=selected_ma or [])
 
 
 @app.callback(
@@ -411,13 +509,26 @@ def update_chart(symbol: str, timeframe: str, selected_ma: Optional[List[str]]):
     Input("ticker", "value"),  # triggers when ticker changes
 )
 def update_company_info(symbol: str):
-    if not symbol:
+    symbols = _normalize_selected_symbols(symbol)
+    if not symbols:
         return ("—", "Sector: —  •  Industry: —", "Market Cap: —", "Select a ticker to view company information.")
     
+    if len(symbols) > 1:
+        preview = ", ".join(symbols[:5])
+        if len(symbols) > 5:
+            preview += ", ..."
+        return (
+            "Comparison mode",
+            f"Selected tickers: {preview}",
+            "Market Cap: —",
+            "Company snapshot is only shown when a single ticker is selected.",
+        )
+
+    selected_symbol = symbols[0]
     try:
-        info = get_company_snapshot(symbol)  # <-- implement
+        info = get_company_snapshot(selected_symbol)  # <-- implement
     except Exception as e:
-        print(f"Error loading company info for {symbol}: {e}")
+        print(f"Error loading company info for {selected_symbol}: {e}")
         info = None
 
     if not info:
@@ -428,7 +539,7 @@ def update_company_info(symbol: str):
             "Connect your company data in get_company_snapshot(...).",
         )
 
-    name = info.get("name") or symbol
+    name = info.get("name") or selected_symbol
     sector = info.get("sector", "—")
     industry = info.get("industry", "—")
     cap = info.get("marketCap")
@@ -445,7 +556,7 @@ def update_company_info(symbol: str):
             return "—"
 
     return (
-        f"{name} ({symbol})",
+        f"{name} ({selected_symbol})",
         f"Sector: {sector}  •  Industry: {industry}",
         f"Market Cap: {fmt_money(cap)}",
         about,
@@ -487,10 +598,13 @@ def build_promising_panel(ticker_list):
     prevent_initial_call=False,
 )
 def build_similar_stocks_panel(symbol: str):
-    if not symbol:
+    symbols = _normalize_selected_symbols(symbol)
+    if not symbols:
         return html.Div("Select a ticker to view similar stocks.", style={"color": "#777"})
+    if len(symbols) != 1:
+        return html.Div()
 
-    neighbors = SIMILARITY_MAP.get(str(symbol).upper(), [])[:10]
+    neighbors = SIMILARITY_MAP.get(symbols[0], [])[:10]
     if not neighbors:
         return html.Div("No autoencoder similarity data available for this ticker.", style={"color": "#777"})
 
@@ -534,6 +648,18 @@ def _has_real_click(value) -> bool:
         return float(value) > 0
     except (TypeError, ValueError):
         return False
+
+
+@app.callback(
+    Output("similar-stocks-card", "style"),
+    Input("ticker", "value"),
+    prevent_initial_call=False,
+)
+def toggle_similar_stocks_card(symbol):
+    symbols = _normalize_selected_symbols(symbol)
+    if len(symbols) == 1:
+        return CARD_STYLE
+    return {**CARD_STYLE, "display": "none"}
 
 # Poll cache file; only update Store when content actually changes (avoids re-mounting buttons every 5s)
 @app.callback(
@@ -636,7 +762,7 @@ def set_ticker_from_panel(_promising_clicks, _similar_clicks, _near200w_clicks, 
         return dash.no_update
     if not _has_real_click(ctx.triggered[0].get("value")):
         return dash.no_update
-    return ctx.triggered_id["index"]
+    return [ctx.triggered_id["index"]]
 
 # ------------------------------------------------------------
 # YOUR DATA FUNCTIONS — replace these stubs
