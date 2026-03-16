@@ -1,6 +1,8 @@
 price_history/
 promising_stocks.csv
 .venv/
+__pycache__/
+*.pyc
 adj_close_wide.csv
 UI.png
 .env
