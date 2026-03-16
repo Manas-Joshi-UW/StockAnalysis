@@ -35,21 +35,64 @@ DEFAULT_TICKERS = [
     {"label": "Microsoft (MSFT)", "value": "MSFT"},
     {"label": "Advanced Micro Devices (AMD)", "value": "AMD"},
 ]
+DEFAULT_TICKER_NAMES = {
+    item["value"]: item["label"].rsplit("(", 1)[0].strip()
+    for item in DEFAULT_TICKERS
+}
+
+
+def _load_listing_name_map() -> Dict[str, str]:
+    csv_path = os.path.join(os.path.dirname(__file__) or ".", "nyse_nasdaq_listings.csv")
+    if not os.path.isfile(csv_path):
+        return {}
+    try:
+        df = pd.read_csv(csv_path, usecols=["Symbol", "Security Name"])
+        df["Symbol"] = df["Symbol"].astype(str).str.strip().str.upper()
+        df["Security Name"] = df["Security Name"].fillna("").astype(str).str.strip()
+        df = df[df["Symbol"] != ""].drop_duplicates(subset=["Symbol"], keep="first")
+        return {
+            row["Symbol"]: row["Security Name"]
+            for _, row in df.iterrows()
+            if row["Security Name"]
+        }
+    except Exception as e:
+        print(f"Error loading ticker name map: {e}")
+        return {}
+
+
+LISTING_NAME_MAP = _load_listing_name_map()
+
+
+def _ticker_option(symbol: str) -> Dict[str, str]:
+    name = LISTING_NAME_MAP.get(symbol) or DEFAULT_TICKER_NAMES.get(symbol) or ""
+    label = f"{symbol} - {name}" if name else symbol
+    return {"label": label, "value": symbol}
+
 
 def _load_ticker_options():
     parquet_dir = "price_history"
     parquet_tickers = []
     if os.path.isdir(parquet_dir):
-        parquet_tickers = [f.name.replace(".parquet", "") for f in os.scandir(parquet_dir) if f.is_file()]
+        parquet_tickers = [
+            f.name.replace(".parquet", "").upper()
+            for f in os.scandir(parquet_dir)
+            if f.is_file()
+        ]
     promising = []
     csv_path = os.path.join(os.path.dirname(__file__) or ".", "promising_stocks.csv")
     if os.path.isfile(csv_path):
         try:
             df = pd.read_csv(csv_path)
-            promising = df["ticker"].dropna().astype(str).str.strip().tolist()
+            promising = df["ticker"].dropna().astype(str).str.strip().str.upper().tolist()
         except Exception:
             pass
-    return sorted(set(parquet_tickers) | set(promising))
+    ordered_symbols = list(
+        dict.fromkeys(
+            list(DEFAULT_TICKER_NAMES)
+            + sorted(set(parquet_tickers) | set(promising))
+        )
+    )
+    return [_ticker_option(symbol) for symbol in ordered_symbols]
 
 tickers = _load_ticker_options()
 
@@ -105,6 +148,47 @@ app.title = APP_TITLE
 # Optionally: Open/High/Low/Volume for candlesticks.
 # ------------------------------------------------------------
 
+def _column_lookup(df: pd.DataFrame) -> Dict[str, object]:
+    if isinstance(df.columns, pd.MultiIndex):
+        return {str(column[0]).lower(): column for column in df.columns}
+    return {str(column).lower(): column for column in df.columns}
+
+
+def _extract_price_series(df_price: Optional[pd.DataFrame]) -> Optional[pd.Series]:
+    if df_price is None or df_price.empty:
+        return None
+
+    cols = _column_lookup(df_price)
+    price_col = cols.get("close") or cols.get("adj close") or next(iter(cols.values()), None)
+    if price_col is None:
+        return None
+
+    series = df_price[price_col]
+    if isinstance(series, pd.DataFrame):
+        series = series.iloc[:, 0]
+    series = pd.to_numeric(series, errors="coerce").dropna()
+    if series.empty:
+        return None
+    return series
+
+
+def _normalize_symbol_selection(value) -> List[str]:
+    if value is None:
+        return []
+    raw_values = value if isinstance(value, (list, tuple)) else [value]
+    selected_symbols: List[str] = []
+    for raw_value in raw_values:
+        symbol = str(raw_value or "").strip().upper()
+        if symbol and symbol not in selected_symbols:
+            selected_symbols.append(symbol)
+    return selected_symbols
+
+
+def _primary_selected_symbol(value) -> Optional[str]:
+    selected_symbols = _normalize_symbol_selection(value)
+    return selected_symbols[0] if selected_symbols else None
+
+
 def extra_info_in_title(df_price: pd.DataFrame) -> Dict[str, str]:
     """
     Extract key statistics from price data for display in chart title.
@@ -113,72 +197,58 @@ def extra_info_in_title(df_price: pd.DataFrame) -> Dict[str, str]:
     if df_price is None or df_price.empty:
         return {}
     info = {}
-    # Get the main price column (Close or Adj Close)
-    price_col = None
-    if "Close" in df_price.columns:
-        price_col = "Close"
-    elif "Adj Close" in df_price.columns:
-        price_col = "Adj Close"
-    elif len(df_price.columns) > 0:
-        # Fallback to first numeric column
-        price_col = df_price.columns[0]
-    if price_col is None:
-        print("No price column found")
+    cols = _column_lookup(df_price)
+    price_data = _extract_price_series(df_price)
+    if price_data is None:
         return {}
-    
-    try:
-        price_data = df_price[price_col].dropna()
-        if len(price_data) == 0:
-            return {}
 
-        print(f"Current price: {price_data.iloc[-1].values[0]}")
-        # Current price (most recent)
-        current_price = price_data.iloc[-1].values[0]
+    try:
+        current_price = float(price_data.iloc[-1])
         info["Current"] = f"${current_price:.2f}"
-        
-        # Maximum price
-        max_price = price_data.max().values[0]
-        print(f"Max price: {max_price}")
+
+        max_price = float(price_data.max())
         info["Max"] = f"${max_price:.2f}"
-        
-        # Minimum price
-        min_price = price_data.min().values[0]
+
+        min_price = float(price_data.min())
         info["Min"] = f"${min_price:.2f}"
-        # Price change (current vs first)
-        first_price = price_data.iloc[0].values[0]
+
+        first_price = float(price_data.iloc[0])
         price_change = current_price - first_price
-        price_change_pct = (price_change / first_price) * 100
-        
-        if price_change >= 0:
+        price_change_pct = (price_change / first_price) * 100 if first_price else 0.0
+
+        if price_change > 0:
             info["Change"] = f"+${price_change:.2f} (+{price_change_pct:.1f}%)"
+        elif price_change < 0:
+            info["Change"] = f"-${abs(price_change):.2f} ({price_change_pct:.1f}%)"
         else:
-            info["Change"] = f"${price_change:.2f} ({price_change_pct:.1f}%)"
-        print(f"info: {info}")
-        # Volume info if available
-        if "Volume" in df_price.columns:
-            volume_data = df_price["Volume"].dropna()
-            if len(volume_data) > 0:
-                avg_volume = volume_data.mean().values[0]
+            info["Change"] = "$0.00 (0.0%)"
+
+        volume_col = cols.get("volume")
+        if volume_col is not None:
+            volume_data = df_price[volume_col]
+            if isinstance(volume_data, pd.DataFrame):
+                volume_data = volume_data.iloc[:, 0]
+            volume_data = pd.to_numeric(volume_data, errors="coerce").dropna()
+            if not volume_data.empty:
+                avg_volume = float(volume_data.mean())
                 if avg_volume >= 1e9:
                     info["Avg Vol"] = f"{avg_volume/1e9:.1f}B"
                 elif avg_volume >= 1e6:
                     info["Avg Vol"] = f"{avg_volume/1e6:.1f}M"
                 else:
                     info["Avg Vol"] = f"{avg_volume/1e3:.1f}K"
-        
-        # Date range info
-        if len(df_price.index) > 1:
+
+        if len(df_price.index) > 1 and hasattr(df_price.index[0], "strftime"):
             start_date = df_price.index[0].strftime("%b %Y")
             end_date = df_price.index[-1].strftime("%b %Y")
             if start_date != end_date:
                 info["Period"] = f"{start_date} - {end_date}"
             else:
                 info["Period"] = start_date
-                
+
     except Exception as e:
         print(f"Error calculating extra info: {e}")
         return {}
-    print(f"info: {info}")
     return info
 
 
@@ -204,7 +274,7 @@ def make_price_figure(
             )],
             margin=dict(l=10, r=10, t=30, b=10),
             template="plotly_white",
-            title=f"{symbol} — {timeframe_label}"
+            title=f"{symbol} - {timeframe_label}"
         )
         return fig
 
@@ -265,25 +335,14 @@ def make_price_figure(
             ma_series = close.rolling(window, min_periods=window).mean()
             fig.add_trace(go.Scatter(x=df.index, y=ma_series, name=label, mode="lines"))
 
-    # Get extra info for title
-    extra_info = extra_info_in_title(df)
     fig.update_layout(showlegend=bool(selected_ma))
-    
-    # Build title with extra info
-    title_parts = [f"{symbol} — {timeframe_label}"]
 
-    if extra_info:
-        # Add key statistics to title in smaller font
-        info_text = " | ".join([f"{k}: {v}" for k, v in extra_info.items()])
-        title_parts.append(f"<span style='font-size: 10px;'>{info_text}</span>")
-    title = "<br>".join(title_parts)
-    
     fig.update_layout(
         template="plotly_white",
         margin=dict(l=10, r=10, t=30, b=10),
         legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
         xaxis_title=None, yaxis_title=None,
-        title=title
+        title=f"{symbol} - {timeframe_label}"
     )
 
     # Hide non-trading gaps for intraday views (1D / 5D)
@@ -297,17 +356,377 @@ def make_price_figure(
 
     return fig
 
+
+def make_normalized_returns_figure(series_map: Dict[str, pd.Series], timeframe_label: str) -> go.Figure:
+    fig = go.Figure()
+
+    if not series_map:
+        fig.update_layout(
+            annotations=[
+                dict(
+                    text="Add comparison tickers to view normalized returns.",
+                    x=0.5,
+                    y=0.5,
+                    xref="paper",
+                    yref="paper",
+                    showarrow=False,
+                    font=dict(size=14, color="#888"),
+                )
+            ],
+            margin=dict(l=10, r=10, t=40, b=10),
+            template="plotly_white",
+            title=f"Normalized Returns - {timeframe_label}",
+            yaxis_title="Return (%)",
+        )
+        return fig
+
+    for index, (symbol, series) in enumerate(series_map.items()):
+        fig.add_trace(
+            go.Scatter(
+                x=series.index,
+                y=series,
+                name=symbol,
+                mode="lines",
+                line=dict(width=3 if index == 0 else 2),
+            )
+        )
+
+    fig.add_hline(y=0, line_width=1, line_dash="dot", line_color="#98a2b3")
+    fig.update_layout(
+        template="plotly_white",
+        margin=dict(l=10, r=10, t=40, b=10),
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+        xaxis_title=None,
+        yaxis_title="Return (%)",
+        title=f"Normalized Returns - {timeframe_label}",
+    )
+    return fig
+
+
+def make_multi_symbol_figure(
+    series_map: Dict[str, pd.Series],
+    timeframe_label: str,
+    *,
+    normalized: bool,
+) -> go.Figure:
+    fig = go.Figure()
+
+    if not series_map:
+        fig.update_layout(
+            annotations=[
+                dict(
+                    text="Select one or more stocks to view the chart.",
+                    x=0.5,
+                    y=0.5,
+                    xref="paper",
+                    yref="paper",
+                    showarrow=False,
+                    font=dict(size=14, color="#888"),
+                )
+            ],
+            margin=dict(l=10, r=10, t=40, b=10),
+            template="plotly_white",
+            title=f"Selected Stocks - {timeframe_label}",
+            yaxis_title="Return (%)" if normalized else "Price ($)",
+        )
+        return fig
+
+    symbols = list(series_map.keys())
+    title_symbols = ", ".join(symbols[:3])
+    if len(symbols) > 3:
+        title_symbols = f"{title_symbols} +{len(symbols) - 3} more"
+
+    title = f"{title_symbols} - {timeframe_label}"
+    if normalized:
+        title = f"{title} (Normalized)"
+
+    show_period_return = len(series_map) > 1
+    for index, (symbol, series) in enumerate(series_map.items()):
+        legend_name = symbol
+        if show_period_return:
+            try:
+                if normalized:
+                    period_return_pct = float(series.iloc[-1])
+                else:
+                    first_value = float(series.iloc[0])
+                    last_value = float(series.iloc[-1])
+                    period_return_pct = ((last_value / first_value) - 1.0) * 100.0 if first_value else 0.0
+                legend_name = f"{symbol} ({period_return_pct:+.1f}%)"
+            except Exception:
+                legend_name = symbol
+        fig.add_trace(
+            go.Scatter(
+                x=series.index,
+                y=series,
+                name=legend_name,
+                mode="lines",
+                line=dict(width=3 if index == 0 else 2),
+            )
+        )
+
+    if normalized:
+        fig.add_hline(y=0, line_width=1, line_dash="dot", line_color="#98a2b3")
+
+    fig.update_layout(
+        template="plotly_white",
+        margin=dict(l=10, r=10, t=40, b=10),
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+        xaxis_title=None,
+        yaxis_title="Return (%)" if normalized else "Price ($)",
+        title=title,
+    )
+
+    if timeframe_label in ("1D", "5D"):
+        fig.update_xaxes(
+            rangebreaks=[
+                dict(bounds=["sat", "mon"]),
+                dict(bounds=[16, 9.5], pattern="hour"),
+            ]
+        )
+
+    return fig
+
+
+SUMMARY_METRICS = ("Current", "Change", "Max", "Min", "Avg Vol")
+TICKER_BUTTON_STYLE = {
+    "display": "block",
+    "width": "100%",
+    "textAlign": "left",
+    "marginBottom": 4,
+    "cursor": "pointer",
+    "padding": "6px 8px",
+    "border": "1px solid #e0e0e0",
+    "borderRadius": 4,
+    "background": "#fafafa",
+}
+SIMILAR_BUTTON_STYLE = {
+    "display": "flex",
+    "justifyContent": "space-between",
+    "alignItems": "center",
+    "width": "100%",
+    "textAlign": "left",
+    "marginBottom": 4,
+    "cursor": "pointer",
+    "padding": "6px 8px",
+    "border": "1px solid #e0e0e0",
+    "borderRadius": 4,
+    "background": "#fafafa",
+    "gap": 8,
+}
+TICKER_LIST_STYLE = {"display": "grid", "gap": 4, "maxHeight": 280, "overflowY": "auto"}
+SIMILAR_LIST_STYLE = {"display": "grid", "gap": 4, "maxHeight": 320, "overflowY": "auto"}
+PANEL_MESSAGE_STYLE = {"color": "#667085", "fontSize": 13, "lineHeight": 1.5}
+PANEL_ERROR_STYLE = {
+    "border": "1px solid #f5c2c7",
+    "borderRadius": 8,
+    "padding": "10px 12px",
+    "background": "#fff5f5",
+    "display": "grid",
+    "gap": 6,
+}
+PANEL_TIMESTAMP_STYLE = {"color": "#666", "fontSize": 12}
+PRICE_SUMMARY_ROW_STYLE = {
+    "display": "grid",
+    "gridTemplateColumns": "repeat(auto-fit, minmax(130px, 1fr))",
+    "gap": 8,
+    "marginBottom": 12,
+}
+SUMMARY_CARD_STYLE = {
+    "border": "1px solid #e6e6e6",
+    "borderRadius": 10,
+    "padding": "8px 10px",
+    "background": "#fafafa",
+}
+SUMMARY_LABEL_STYLE = {"color": "#667085", "fontSize": 12, "marginBottom": 4}
+SUMMARY_VALUE_STYLE = {"fontWeight": 700, "fontSize": 15, "color": "#101828"}
+
+
+def _timestamp_now() -> str:
+    return datetime.now().isoformat(timespec="seconds")
+
+
+def _file_timestamp(path: str) -> Optional[str]:
+    if not path or not os.path.isfile(path):
+        return None
+    try:
+        return datetime.fromtimestamp(os.path.getmtime(path)).isoformat(timespec="seconds")
+    except OSError:
+        return None
+
+
+def _format_updated_label(updated_at: Optional[str]) -> str:
+    if not updated_at:
+        return "Updated recently"
+    try:
+        dt = datetime.fromisoformat(updated_at)
+        return f"Updated {dt.strftime('%b %d, %I:%M %p')}"
+    except ValueError:
+        return "Updated recently"
+
+
+def _build_panel_state(
+    items: Optional[List[str]] = None,
+    *,
+    status: Optional[str] = None,
+    message: Optional[str] = None,
+    updated_at: Optional[str] = None,
+) -> Dict[str, object]:
+    normalized_items = [item for item in (items or []) if item]
+    resolved_status = status or ("ready" if normalized_items else "empty")
+    payload: Dict[str, object] = {"status": resolved_status, "items": normalized_items}
+    if message:
+        payload["message"] = message
+    if updated_at:
+        payload["updated_at"] = updated_at
+    return payload
+
+
+def _normalize_cached_panel_payload(payload, cache_file: Optional[str] = None) -> Dict[str, object]:
+    if isinstance(payload, dict) and payload.get("status"):
+        normalized = dict(payload)
+        normalized.setdefault("items", [])
+        if normalized["status"] in {"ready", "empty"}:
+            normalized["items"] = [item for item in normalized.get("items", []) if item]
+            normalized.setdefault("updated_at", _file_timestamp(cache_file) or _timestamp_now())
+            if normalized["status"] == "ready" and not normalized["items"]:
+                normalized["status"] = "empty"
+        return normalized
+    if isinstance(payload, list):
+        return _build_panel_state(payload, updated_at=_file_timestamp(cache_file) or _timestamp_now())
+    if payload is None:
+        return _build_panel_state(status="loading")
+    return _build_panel_state(
+        status="error",
+        message="Unexpected panel data format. Refresh the page to retry.",
+        updated_at=_file_timestamp(cache_file) or _timestamp_now(),
+    )
+
+
+def _build_price_summary_cards(info: Optional[Dict[str, str]]):
+    info = info or {}
+    cards = []
+    for label in SUMMARY_METRICS:
+        value = info.get(label) or "--"
+        value_style = dict(SUMMARY_VALUE_STYLE)
+        if label == "Change":
+            normalized_value = value.strip() if isinstance(value, str) else ""
+            has_numeric_change = any(char.isdigit() for char in normalized_value)
+            if has_numeric_change and normalized_value.startswith("+"):
+                value_style["color"] = "#1a7f37"
+            elif has_numeric_change and normalized_value.startswith("-"):
+                value_style["color"] = "#b42318"
+        cards.append(
+            html.Div(
+                [
+                    html.Div(label, style=SUMMARY_LABEL_STYLE),
+                    html.Div(value, style=value_style),
+                ],
+                style=SUMMARY_CARD_STYLE,
+            )
+        )
+    return cards
+
+
+def _render_ticker_buttons(items: List[str], button_type: str):
+    return html.Div(
+        [
+            html.Button(item, id={"type": button_type, "index": item}, style=TICKER_BUTTON_STYLE)
+            for item in items
+        ],
+        style=TICKER_LIST_STYLE,
+    )
+
+
+def _render_async_ticker_panel(
+    panel_data,
+    *,
+    button_type: str,
+    loading_message: str,
+    empty_message: str,
+    error_message: str,
+):
+    payload = _normalize_cached_panel_payload(panel_data)
+    status = payload.get("status")
+
+    if status == "loading":
+        return html.Div(payload.get("message") or loading_message, style=PANEL_MESSAGE_STYLE)
+
+    if status == "error":
+        return html.Div(
+            [
+                html.Div(payload.get("message") or error_message, style={"fontWeight": 600, "color": "#b42318"}),
+                html.Div("Refresh the page or rerun the background scan to retry this panel.", style=PANEL_MESSAGE_STYLE),
+            ],
+            style=PANEL_ERROR_STYLE,
+        )
+
+    updated_label = html.Div(_format_updated_label(payload.get("updated_at")), style=PANEL_TIMESTAMP_STYLE)
+    items = [item for item in payload.get("items", []) if item]
+    if not items:
+        return html.Div(
+            [updated_label, html.Div(empty_message, style=PANEL_MESSAGE_STYLE)],
+            style={"display": "grid", "gap": 6},
+        )
+
+    return html.Div(
+        [updated_label, _render_ticker_buttons(items, button_type)],
+        style={"display": "grid", "gap": 8},
+    )
+
 # ------------------------------------------------------------
 # Layout
 # ------------------------------------------------------------
-app.layout = html.Div(
+PAGE_CONTAINER_STYLE = {
+    "maxWidth": 1200,
+    "margin": "0 auto",
+    "padding": 14,
+    "width": "100%",
+    "boxSizing": "border-box",
+    "display": "grid",
+    "gap": 12,
+}
+HEADER_STYLE = {"display": "flex", "flexDirection": "column", "gap": 4}
+CONTROL_STACK_STYLE = {"display": "grid", "gap": 12}
+SEARCH_BLOCK_STYLE = {"display": "grid", "gap": 6}
+TOP_CONTROL_ROW_STYLE = {
+    "display": "flex",
+    "flexWrap": "wrap",
+    "gap": 12,
+    "alignItems": "flex-start",
+}
+CONTROL_BLOCK_STYLE = {"display": "grid", "gap": 6, "flex": "1 1 220px", "minWidth": 0}
+WIDE_CONTROL_BLOCK_STYLE = {"display": "grid", "gap": 6, "flex": "2 1 360px", "minWidth": 0}
+DISABLED_CONTROL_BLOCK_STYLE = {
+    "opacity": 0.45,
+    "background": "#f5f5f5",
+    "border": "1px solid #e4e7ec",
+    "borderRadius": 10,
+    "padding": 10,
+}
+CONTROL_LABEL_STYLE = {"fontSize": 12, "fontWeight": 600, "color": "#667085"}
+CONTROL_HINT_STYLE = {"fontSize": 12, "color": "#667085"}
+DROPDOWN_STYLE = {"width": "100%", "minWidth": 0}
+RADIO_ITEMS_STYLE = {"display": "flex", "flexWrap": "wrap", "gap": "8px 12px"}
+RADIO_LABEL_STYLE = {"display": "flex", "alignItems": "center", "marginRight": 0}
+CHECKLIST_STYLE = {"display": "flex", "flexWrap": "wrap", "gap": "8px 16px"}
+CHECKLIST_LABEL_STYLE = {"display": "flex", "alignItems": "center", "marginRight": 0}
+MAIN_CONTENT_GRID_STYLE = {"display": "flex", "flexWrap": "wrap", "gap": 12, "alignItems": "flex-start"}
+LEFT_CONTENT_COLUMN_STYLE = {"display": "grid", "gap": 12, "flex": "999 1 680px", "minWidth": 0}
+RIGHT_SIDEBAR_STYLE = {"display": "grid", "gap": 12, "flex": "1 1 320px", "minWidth": 0}
+
+"""
+_LEGACY_LAYOUT = html.Div(
     [
-        # Headera
-        html.Div([
-            html.H1(APP_TITLE, style={"margin": 0}),
-            html.Div("Explore unfamiliar tickers with price history and quick context.",
-                    style={"color": "#666"}),
-        ], style={"display": "flex", "flexDirection": "column", "gap": 4, "marginBottom": 12}),
+        html.Div(
+            [
+                html.H1(APP_TITLE, style={"margin": 0}),
+                html.Div(
+                    "Explore unfamiliar tickers with price history and quick context.",
+                    style={"color": "#666"},
+                ),
+            ],
+            style=HEADER_STYLE,
+        ),
 
         # Search row
         html.Div([
@@ -378,6 +797,199 @@ app.layout = html.Div(
             ], style={"minWidth": 340, "display": "grid", "gap": 12}),
         ], style={"display": "grid", "gridTemplateColumns": "1fr 360px", "gap": 12}),
     ], style={"maxWidth": 1200, "margin": "0 auto", "padding": 14})
+"""
+
+app.layout = html.Div(
+    [
+        html.Div(
+            [
+                html.H1(APP_TITLE, style={"margin": 0}),
+                html.Div(
+                    "Explore unfamiliar tickers with price history and quick context.",
+                    style={"color": "#666"},
+                ),
+            ],
+            style=HEADER_STYLE,
+        ),
+        html.Div(
+            [
+                html.Div(
+                    [
+                        html.Div("Search", style=CONTROL_LABEL_STYLE),
+                        html.Div("Select one or more tickers or company names.", style=CONTROL_HINT_STYLE),
+                        dcc.Dropdown(
+                            id="ticker",
+                            options=tickers,
+                            value=["AAPL"],
+                            multi=True,
+                            placeholder="Start typing a ticker or company name...",
+                            maxHeight=420,
+                            style=DROPDOWN_STYLE,
+                        ),
+                    ],
+                    style=SEARCH_BLOCK_STYLE,
+                ),
+                html.Div(
+                    [
+                        html.Div(
+                            [
+                                html.Div(
+                                    [
+                                        html.Div("Timeframe", style=CONTROL_LABEL_STYLE),
+                                        dcc.RadioItems(
+                                            id="timeframe",
+                                            options=[{"label": lab, "value": val} for lab, val in TIMEFRAMES],
+                                            value="6mo",
+                                            style=RADIO_ITEMS_STYLE,
+                                            labelStyle=RADIO_LABEL_STYLE,
+                                        ),
+                                    ],
+                                    style=CONTROL_BLOCK_STYLE,
+                                ),
+                                html.Div(
+                                    [
+                                        html.Div("Moving averages", style=CONTROL_LABEL_STYLE),
+                                        dcc.Checklist(
+                                            id="ma-checklist",
+                                            options=[{"label": lab, "value": val} for lab, val, _ in MA_OPTIONS],
+                                            value=[],
+                                            style=CHECKLIST_STYLE,
+                                            labelStyle=CHECKLIST_LABEL_STYLE,
+                                        ),
+                                    ],
+                                    id="ma-control-block",
+                                    style=WIDE_CONTROL_BLOCK_STYLE,
+                                ),
+                                html.Div(
+                                    [
+                                        html.Div("Chart mode", style=CONTROL_LABEL_STYLE),
+                                        dcc.Checklist(
+                                            id="normalized-toggle",
+                                            options=[{"label": "Show normalized returns", "value": "normalized"}],
+                                            value=[],
+                                            style=CHECKLIST_STYLE,
+                                            labelStyle=CHECKLIST_LABEL_STYLE,
+                                        ),
+                                    ],
+                                    style=CONTROL_BLOCK_STYLE,
+                                ),
+                            ],
+                            style=TOP_CONTROL_ROW_STYLE,
+                        ),
+                    ],
+                    style=SEARCH_BLOCK_STYLE,
+                ),
+            ],
+            style=CONTROL_STACK_STYLE,
+        ),
+        html.Div(
+            [
+                html.Div(
+                    [
+                        html.Div(
+                            [
+                                html.Div(
+                                    id="price-summary",
+                                    children=_build_price_summary_cards({}),
+                                    style=PRICE_SUMMARY_ROW_STYLE,
+                                ),
+                                dcc.Loading(
+                                    dcc.Graph(
+                                        id="price-chart",
+                                        figure=make_price_figure(None, "--", "--"),
+                                        config={"displaylogo": False, "responsive": True},
+                                        style={"width": "100%"},
+                                    ),
+                                    type="default",
+                                ),
+                            ],
+                            style=CARD_STYLE,
+                        ),
+                        html.Div(
+                            [
+                                html.H3("Company Snapshot", style={"marginTop": 0}),
+                                html.Div(id="company-name", style={"fontWeight": 600}),
+                                html.Div(id="company-meta", style={"color": "#666", "marginBottom": 6}),
+                                html.Div(id="company-cap", style={"marginBottom": 10}),
+                                html.Div("About:", style={"fontWeight": 600, "marginTop": 6}),
+                                html.Div(id="company-about", style={"whiteSpace": "pre-wrap"}),
+                            ],
+                            style=CARD_STYLE,
+                        ),
+                    ],
+                    style=LEFT_CONTENT_COLUMN_STYLE,
+                ),
+                html.Div(
+                    [
+                        dcc.Store(
+                            id="promising-store",
+                            data={"status": "loading", "message": "Loading promising stocks...", "items": []},
+                        ),
+                        dcc.Store(
+                            id="near-200w-store",
+                            data={"status": "loading", "message": "Scanning for tickers near the 200-week moving average...", "items": []},
+                        ),
+                        dcc.Store(
+                            id="below-50w-store",
+                            data={"status": "loading", "message": "Scanning for tickers below the 50-week moving average...", "items": []},
+                        ),
+                        html.Div(
+                            [
+                                html.H3("Promising stocks", style={"marginTop": 0}),
+                                html.Div(
+                                    id="promising-stocks",
+                                    children=html.Div("Loading promising stocks...", style=PANEL_MESSAGE_STYLE),
+                                ),
+                            ],
+                            style=CARD_STYLE,
+                        ),
+                        html.Div(
+                            [
+                                html.H3("Most Similar Stocks", style={"marginTop": 0}),
+                                html.Div(
+                                    id="similar-stocks",
+                                    children=html.Div("Loading similar stocks...", style=PANEL_MESSAGE_STYLE),
+                                ),
+                            ],
+                            style=CARD_STYLE,
+                        ),
+                        html.Div(
+                            [
+                                html.H3("Within 10% of 200-week MA", style={"marginTop": 0}),
+                                html.Div(
+                                    id="near-200w-ma",
+                                    children=html.Div(
+                                        "Scanning for tickers near the 200-week moving average...",
+                                        style=PANEL_MESSAGE_STYLE,
+                                    ),
+                                ),
+                            ],
+                            style=CARD_STYLE,
+                        ),
+                        html.Div(
+                            [
+                                html.H3("Below 50-week MA", style={"marginTop": 0}),
+                                html.Div(
+                                    id="below-50w-ma",
+                                    children=html.Div(
+                                        "Scanning for tickers below the 50-week moving average...",
+                                        style=PANEL_MESSAGE_STYLE,
+                                    ),
+                                ),
+                            ],
+                            style=CARD_STYLE,
+                        ),
+                        dcc.Interval(id="interval-near200w", interval=5_000, n_intervals=0),
+                        dcc.Interval(id="interval-below50w", interval=5_000, n_intervals=0),
+                    ],
+                    style=RIGHT_SIDEBAR_STYLE,
+                ),
+            ],
+            style=MAIN_CONTENT_GRID_STYLE,
+        ),
+    ],
+    style=PAGE_CONTAINER_STYLE,
+)
 
 # ------------------------------------------------------------
 # Callbacks — these call your functions (stubs below)
@@ -388,19 +1000,91 @@ app.layout = html.Div(
     Input("ticker", "value"),
     Input("timeframe", "value"),
     Input("ma-checklist", "value"),
+    Input("normalized-toggle", "value"),
     prevent_initial_call=False,
 )
-def update_chart(symbol: str, timeframe: str, selected_ma: Optional[List[str]]):
-    if not symbol:
-        return make_price_figure(None, "—", "—", selected_ma=selected_ma or [])
-    
+def update_chart(selected_symbols, timeframe: str, selected_ma: Optional[List[str]], normalized_toggle: Optional[List[str]]):
+    symbols = _normalize_symbol_selection(selected_symbols)
+    normalized = "normalized" in (normalized_toggle or [])
+    if not symbols:
+        return make_multi_symbol_figure({}, "--", normalized=normalized)
+
     label = next((lab for lab, val in TIMEFRAMES if val == timeframe), timeframe)
+    if len(symbols) == 1 and not normalized:
+        primary_symbol = symbols[0]
+        try:
+            df = get_price_df(primary_symbol, timeframe)
+        except Exception as e:
+            print(f"Error loading data for {primary_symbol}: {e}")
+            df = None
+        return make_price_figure(df, primary_symbol, label, selected_ma=selected_ma or [])
+
+    series_map: Dict[str, pd.Series] = {}
+    for symbol in symbols:
+        try:
+            df = get_price_df(symbol, timeframe)
+            series = _extract_price_series(df)
+            if series is None:
+                continue
+            if normalized:
+                if len(series) < 2:
+                    continue
+                first_price = float(series.iloc[0])
+                if first_price == 0:
+                    continue
+                series = ((series / first_price) - 1.0) * 100.0
+            series_map[symbol] = series
+        except Exception as e:
+            print(f"Error loading comparison data for {symbol}: {e}")
+
+    return make_multi_symbol_figure(series_map, label, normalized=normalized)
+
+
+@app.callback(
+    Output("ma-checklist", "options"),
+    Output("ma-checklist", "value"),
+    Output("ma-control-block", "style"),
+    Input("ticker", "value"),
+    State("ma-checklist", "value"),
+    prevent_initial_call=False,
+)
+def sync_ma_controls(selected_symbols, selected_ma):
+    symbols = _normalize_symbol_selection(selected_symbols)
+    multi_select_active = len(symbols) > 1
+    options = [
+        {"label": label, "value": value, "disabled": multi_select_active}
+        for label, value, _ in MA_OPTIONS
+    ]
+    control_style = dict(WIDE_CONTROL_BLOCK_STYLE)
+    if multi_select_active:
+        control_style.update(DISABLED_CONTROL_BLOCK_STYLE)
+        return options, [], control_style
+    return options, selected_ma or [], control_style
+
+
+@app.callback(
+    Output("price-summary", "children"),
+    Input("ticker", "value"),
+    Input("timeframe", "value"),
+    prevent_initial_call=False,
+)
+def update_price_summary(symbol: str, timeframe: str):
+    selected_symbols = _normalize_symbol_selection(symbol)
+    if len(selected_symbols) > 1:
+        return _build_price_summary_cards({label: "-" for label in SUMMARY_METRICS})
+
+    primary_symbol = _primary_selected_symbol(symbol)
+    if not primary_symbol:
+        return _build_price_summary_cards({})
+
     try:
-        df = get_price_df(symbol, timeframe)
+        df = get_price_df(primary_symbol, timeframe)
+        info = extra_info_in_title(df)
     except Exception as e:
-        print(f"Error loading data for {symbol}: {e}")
-        df = None
-    return make_price_figure(df, symbol, label, selected_ma=selected_ma or [])
+        print(f"Error loading summary data for {primary_symbol}: {e}")
+        info = {}
+
+    return _build_price_summary_cards(info)
 
 
 @app.callback(
@@ -411,6 +1095,49 @@ def update_chart(symbol: str, timeframe: str, selected_ma: Optional[List[str]]):
     Input("ticker", "value"),  # triggers when ticker changes
 )
 def update_company_info(symbol: str):
+    primary_symbol = _primary_selected_symbol(symbol)
+    if not primary_symbol:
+        return ("--", "Sector: --  |  Industry: --", "Market Cap: --", "Select a ticker to view company information.")
+
+    try:
+        info = get_company_snapshot(primary_symbol)
+    except Exception as e:
+        print(f"Error loading company info for {primary_symbol}: {e}")
+        info = None
+
+    if not info:
+        return (
+            "--",
+            "Sector: --  |  Industry: --",
+            "Market Cap: --",
+            "Connect your company data in get_company_snapshot(...).",
+        )
+
+    name = info.get("name") or primary_symbol
+    sector = info.get("sector", "--")
+    industry = info.get("industry", "--")
+    cap = info.get("marketCap")
+    about = info.get("longBusinessSummary") or "--"
+
+    def fmt_money(n):
+        try:
+            n = float(n)
+            if n >= 1e12:
+                return f"${n/1e12:.2f}T"
+            if n >= 1e9:
+                return f"${n/1e9:.2f}B"
+            if n >= 1e6:
+                return f"${n/1e6:.2f}M"
+            return f"${n:,.0f}"
+        except Exception:
+            return "--"
+
+    return (
+        f"{name} ({primary_symbol})",
+        f"Sector: {sector}  |  Industry: {industry}",
+        f"Market Cap: {fmt_money(cap)}",
+        about,
+    )
     if not symbol:
         return ("—", "Sector: —  •  Industry: —", "Market Cap: —", "Select a ticker to view company information.")
     
@@ -460,9 +1187,17 @@ def update_company_info(symbol: str):
     prevent_initial_call=False,
 )
 def fill_promising_store(_ticker, current):
-    if current is not None:
+    current_state = _normalize_cached_panel_payload(current)
+    if current_state.get("status") in {"ready", "empty"}:
         return dash.no_update
-    return get_promising_tickers()
+    try:
+        return _build_panel_state(get_promising_tickers(), updated_at=_timestamp_now())
+    except Exception as e:
+        print(f"Error loading promising tickers: {e}")
+        return _build_panel_state(
+            status="error",
+            message="Could not load promising stocks from promising_stocks.csv.",
+        )
 
 
 # Build promising-stocks panel from Store (renders once when Store is filled)
@@ -471,14 +1206,14 @@ def fill_promising_store(_ticker, current):
     Input("promising-store", "data"),
     prevent_initial_call=False,
 )
-def build_promising_panel(ticker_list):
-    if not ticker_list:
-        return html.Div("No promising_stocks.csv or empty.", style={"color": "#777"})
-    btn_style = {"display": "block", "width": "100%", "textAlign": "left", "marginBottom": 4, "cursor": "pointer", "padding": "6px 8px", "border": "1px solid #e0e0e0", "borderRadius": 4, "background": "#fafafa"}
-    return html.Div([
-        html.Button(t, id={"type": "ticker-select-promising", "index": t}, style=btn_style)
-        for t in ticker_list
-    ], style={"display": "grid", "gap": 4, "maxHeight": 280, "overflowY": "auto"})
+def build_promising_panel(panel_data):
+    return _render_async_ticker_panel(
+        panel_data,
+        button_type="ticker-select-promising",
+        loading_message="Loading promising stocks...",
+        empty_message="No promising stocks were found.",
+        error_message="Promising stocks could not be loaded.",
+    )
 
 
 @app.callback(
@@ -487,6 +1222,97 @@ def build_promising_panel(ticker_list):
     prevent_initial_call=False,
 )
 def build_similar_stocks_panel(symbol: str):
+    primary_symbol = _primary_selected_symbol(symbol)
+    if not primary_symbol:
+        return html.Div("Select a ticker to view similar stocks.", style=PANEL_MESSAGE_STYLE)
+
+    try:
+        neighbors = SIMILARITY_MAP.get(primary_symbol, [])[:10]
+    except Exception as e:
+        print(f"Error reading similarity data for {primary_symbol}: {e}")
+        return html.Div(
+            [
+                html.Div("Similarity data could not be loaded.", style={"fontWeight": 600, "color": "#b42318"}),
+                html.Div("Refresh the page or rebuild autoencoder_similar_stocks.json to retry.", style=PANEL_MESSAGE_STYLE),
+            ],
+            style=PANEL_ERROR_STYLE,
+        )
+
+    filtered_neighbors = [neighbor for neighbor in neighbors if neighbor.get("ticker")]
+    if not filtered_neighbors:
+        return html.Div(
+            "No autoencoder similarity data is available for this ticker.",
+            style=PANEL_MESSAGE_STYLE,
+        )
+
+    return html.Div(
+        [
+            html.Div("Updated from the local similarity map", style=PANEL_TIMESTAMP_STYLE),
+            html.Div(
+                [
+                    html.Button(
+                        [
+                            html.Span(neighbor.get("ticker", "--"), style={"fontWeight": 600}),
+                            html.Span(
+                                f"L2 distance: {float(neighbor.get('distance', 0.0)):.4f}",
+                                style={"color": "#666", "fontSize": 12},
+                            ),
+                        ],
+                        id={"type": "ticker-select-similar", "index": neighbor.get("ticker", "")},
+                        style=SIMILAR_BUTTON_STYLE,
+                    )
+                    for neighbor in filtered_neighbors
+                ],
+                style=SIMILAR_LIST_STYLE,
+            ),
+        ],
+        style={"display": "grid", "gap": 8},
+    )
+    if not symbol:
+        return html.Div("Select a ticker to view similar stocks.", style=PANEL_MESSAGE_STYLE)
+
+    try:
+        neighbors = SIMILARITY_MAP.get(str(symbol).upper(), [])[:10]
+    except Exception as e:
+        print(f"Error reading similarity data for {symbol}: {e}")
+        return html.Div(
+            [
+                html.Div("Similarity data could not be loaded.", style={"fontWeight": 600, "color": "#b42318"}),
+                html.Div("Refresh the page or rebuild autoencoder_similar_stocks.json to retry.", style=PANEL_MESSAGE_STYLE),
+            ],
+            style=PANEL_ERROR_STYLE,
+        )
+
+    filtered_neighbors = [neighbor for neighbor in neighbors if neighbor.get("ticker")]
+    if not filtered_neighbors:
+        return html.Div(
+            "No autoencoder similarity data is available for this ticker.",
+            style=PANEL_MESSAGE_STYLE,
+        )
+
+    return html.Div(
+        [
+            html.Div("Updated from the local similarity map", style=PANEL_TIMESTAMP_STYLE),
+            html.Div(
+                [
+                    html.Button(
+                        [
+                            html.Span(neighbor.get("ticker", "--"), style={"fontWeight": 600}),
+                            html.Span(
+                                f"L2 distance: {float(neighbor.get('distance', 0.0)):.4f}",
+                                style={"color": "#666", "fontSize": 12},
+                            ),
+                        ],
+                        id={"type": "ticker-select-similar", "index": neighbor.get("ticker", "")},
+                        style=SIMILAR_BUTTON_STYLE,
+                    )
+                    for neighbor in filtered_neighbors
+                ],
+                style=SIMILAR_LIST_STYLE,
+            ),
+        ],
+        style={"display": "grid", "gap": 8},
+    )
     if not symbol:
         return html.Div("Select a ticker to view similar stocks.", style={"color": "#777"})
 
@@ -544,22 +1370,35 @@ def _has_real_click(value) -> bool:
     prevent_initial_call=False,
 )
 def update_near_200w_store(_ticker, _n_intervals, current_list):
+    loading_state = _build_panel_state(
+        status="loading",
+        message="Scanning for tickers near the 200-week moving average...",
+    )
     if not os.path.isfile(_NEAR_200W_CACHE_FILE):
         if not os.path.isfile(_NEAR_200W_LOCK_FILE):
             try:
-                open(_NEAR_200W_LOCK_FILE, "w").close()
+                with open(_NEAR_200W_LOCK_FILE, "w", encoding="utf-8") as handle:
+                    handle.write(_timestamp_now())
                 t = threading.Thread(target=_compute_near_200w_ma_to_cache, daemon=True)
                 t.start()
-            except Exception:
-                pass
-        return dash.no_update
+            except Exception as e:
+                print(f"Error starting 200-week MA scan: {e}")
+                return _build_panel_state(
+                    status="error",
+                    message="Could not start the 200-week MA scan.",
+                )
+        return current_list if current_list else loading_state
     try:
-        with open(_NEAR_200W_CACHE_FILE) as f:
-            new_list = json.load(f)
-        if new_list != current_list:
-            return new_list
-    except Exception:
-        pass
+        with open(_NEAR_200W_CACHE_FILE, encoding="utf-8") as f:
+            payload = _normalize_cached_panel_payload(json.load(f), _NEAR_200W_CACHE_FILE)
+        if payload != current_list:
+            return payload
+    except Exception as e:
+        print(f"Error reading 200-week MA cache: {e}")
+        return _build_panel_state(
+            status="error",
+            message="Could not read the 200-week MA results.",
+        )
     return dash.no_update
 
 
@@ -570,6 +1409,13 @@ def update_near_200w_store(_ticker, _n_intervals, current_list):
     prevent_initial_call=False,
 )
 def build_near_200w_panel(ticker_list):
+    return _render_async_ticker_panel(
+        ticker_list,
+        button_type="ticker-select-near200w",
+        loading_message="Scanning for tickers near the 200-week moving average...",
+        empty_message="No tickers are currently within 10% of the 200-week moving average.",
+        error_message="The 200-week moving average scan failed.",
+    )
     if not ticker_list:
         return html.Div("Computing in background…", style={"color": "#777"})
     btn_style = {"display": "block", "width": "100%", "textAlign": "left", "marginBottom": 4, "cursor": "pointer", "padding": "6px 8px", "border": "1px solid #e0e0e0", "borderRadius": 4, "background": "#fafafa"}
@@ -588,22 +1434,35 @@ def build_near_200w_panel(ticker_list):
     prevent_initial_call=False,
 )
 def update_below_50w_store(_ticker, _n_intervals, current_list):
+    loading_state = _build_panel_state(
+        status="loading",
+        message="Scanning for tickers below the 50-week moving average...",
+    )
     if not os.path.isfile(_BELOW_50W_CACHE_FILE):
         if not os.path.isfile(_BELOW_50W_LOCK_FILE):
             try:
-                open(_BELOW_50W_LOCK_FILE, "w").close()
+                with open(_BELOW_50W_LOCK_FILE, "w", encoding="utf-8") as handle:
+                    handle.write(_timestamp_now())
                 t = threading.Thread(target=_compute_below_50w_ma_to_cache, daemon=True)
                 t.start()
-            except Exception:
-                pass
-        return dash.no_update
+            except Exception as e:
+                print(f"Error starting 50-week MA scan: {e}")
+                return _build_panel_state(
+                    status="error",
+                    message="Could not start the 50-week MA scan.",
+                )
+        return current_list if current_list else loading_state
     try:
-        with open(_BELOW_50W_CACHE_FILE) as f:
-            new_list = json.load(f)
-        if new_list != current_list:
-            return new_list
-    except Exception:
-        pass
+        with open(_BELOW_50W_CACHE_FILE, encoding="utf-8") as f:
+            payload = _normalize_cached_panel_payload(json.load(f), _BELOW_50W_CACHE_FILE)
+        if payload != current_list:
+            return payload
+    except Exception as e:
+        print(f"Error reading 50-week MA cache: {e}")
+        return _build_panel_state(
+            status="error",
+            message="Could not read the 50-week MA results.",
+        )
     return dash.no_update
 
 
@@ -613,6 +1472,13 @@ def update_below_50w_store(_ticker, _n_intervals, current_list):
     prevent_initial_call=False,
 )
 def build_below_50w_panel(ticker_list):
+    return _render_async_ticker_panel(
+        ticker_list,
+        button_type="ticker-select-below50w",
+        loading_message="Scanning for tickers below the 50-week moving average...",
+        empty_message="No tickers are currently below the 50-week moving average.",
+        error_message="The 50-week moving average scan failed.",
+    )
     if not ticker_list:
         return html.Div("Computing in background…", style={"color": "#777"})
     btn_style = {"display": "block", "width": "100%", "textAlign": "left", "marginBottom": 4, "cursor": "pointer", "padding": "6px 8px", "border": "1px solid #e0e0e0", "borderRadius": 4, "background": "#fafafa"}
@@ -636,7 +1502,7 @@ def set_ticker_from_panel(_promising_clicks, _similar_clicks, _near200w_clicks, 
         return dash.no_update
     if not _has_real_click(ctx.triggered[0].get("value")):
         return dash.no_update
-    return ctx.triggered_id["index"]
+    return [ctx.triggered_id["index"]]
 
 # ------------------------------------------------------------
 # YOUR DATA FUNCTIONS — replace these stubs
@@ -652,14 +1518,29 @@ _BELOW_50W_LOCK_FILE = os.path.join(os.path.dirname(__file__) or ".", ".below_50
 _TF_DAYS = {"1mo": 30, "6mo": 180, "1y": 365, "5y": 1825}
 
 
+def _write_panel_cache(cache_file: str, payload: Dict[str, object]) -> None:
+    with open(cache_file, "w", encoding="utf-8") as handle:
+        json.dump(payload, handle)
+
+
 def _compute_near_200w_ma_to_cache():
     """Run in background: compute get_tickers_near_200w_ma() and write list to cache file."""
     try:
         tickers = get_tickers_near_200w_ma()
-        with open(_NEAR_200W_CACHE_FILE, "w") as f:
-            json.dump(tickers, f)
-    except Exception:
-        pass
+        _write_panel_cache(_NEAR_200W_CACHE_FILE, _build_panel_state(tickers, updated_at=_timestamp_now()))
+    except Exception as e:
+        print(f"Error computing 200-week MA tickers: {e}")
+        try:
+            _write_panel_cache(
+                _NEAR_200W_CACHE_FILE,
+                _build_panel_state(
+                    status="error",
+                    message="The 200-week MA scan failed. Refresh the page to retry.",
+                    updated_at=_timestamp_now(),
+                ),
+            )
+        except Exception as write_error:
+            print(f"Error writing 200-week MA failure state: {write_error}")
     finally:
         if os.path.isfile(_NEAR_200W_LOCK_FILE):
             try:
@@ -672,10 +1553,20 @@ def _compute_below_50w_ma_to_cache():
     """Run in background: compute get_tickers_below_50w_ma() and write list to cache file."""
     try:
         tickers = get_tickers_below_50w_ma()
-        with open(_BELOW_50W_CACHE_FILE, "w") as f:
-            json.dump(tickers, f)
-    except Exception:
-        pass
+        _write_panel_cache(_BELOW_50W_CACHE_FILE, _build_panel_state(tickers, updated_at=_timestamp_now()))
+    except Exception as e:
+        print(f"Error computing 50-week MA tickers: {e}")
+        try:
+            _write_panel_cache(
+                _BELOW_50W_CACHE_FILE,
+                _build_panel_state(
+                    status="error",
+                    message="The 50-week MA scan failed. Refresh the page to retry.",
+                    updated_at=_timestamp_now(),
+                ),
+            )
+        except Exception as write_error:
+            print(f"Error writing 50-week MA failure state: {write_error}")
     finally:
         if os.path.isfile(_BELOW_50W_LOCK_FILE):
             try:
@@ -817,11 +1708,8 @@ def get_promising_tickers() -> List[str]:
     csv_path = os.path.join(os.path.dirname(__file__) or ".", "promising_stocks.csv")
     if not os.path.isfile(csv_path):
         return []
-    try:
-        df = pd.read_csv(csv_path)
-        return df["ticker"].dropna().astype(str).str.strip().tolist()
-    except Exception:
-        return []
+    df = pd.read_csv(csv_path)
+    return df["ticker"].dropna().astype(str).str.strip().tolist()
 
 
 def get_tickers_near_200w_ma(pct_band: float = 0.10) -> List[str]:
