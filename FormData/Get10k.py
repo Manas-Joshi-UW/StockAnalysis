@@ -1,18 +1,49 @@
 import re
+from functools import lru_cache
+from typing import Any, Dict
+
 import requests
-from bs4 import BeautifulSoup
 
 UA = {"User-Agent": "Manas Joshi joshi.manas01@gmail.com"}  # SEC requires a descriptive UA
 
+def _sec_get_json(url: str) -> Dict[str, Any]:
+    response = requests.get(url, headers=UA, timeout=30)
+    response.raise_for_status()
+    return response.json()
+
+
+@lru_cache(maxsize=1)
+def _company_ticker_map() -> Dict[str, str]:
+    payload = _sec_get_json("https://www.sec.gov/files/company_tickers.json")
+    ticker_map: Dict[str, str] = {}
+    for entry in payload.values():
+        ticker = str(entry.get("ticker") or "").strip().upper()
+        cik_value = entry.get("cik_str")
+        if not ticker or cik_value in (None, ""):
+            continue
+        ticker_map[ticker] = str(cik_value).zfill(10)
+    return ticker_map
+
+
 def _ticker_to_cik(ticker: str) -> str:
-    m = requests.get("https://www.sec.gov/files/company_tickers.json", headers=UA).json()
-    for entry in m.values():
-        if entry["ticker"].lower() == ticker.lower():
-            return str(entry["cik_str"]).zfill(10)
+    normalized_ticker = str(ticker or "").strip().upper()
+    cik = _company_ticker_map().get(normalized_ticker)
+    if cik:
+        return cik
     raise ValueError(f"Ticker not found: {ticker}")
 
+
+@lru_cache(maxsize=512)
+def get_company_facts_by_cik(cik: str) -> Dict[str, Any]:
+    normalized_cik = str(cik or "").strip().zfill(10)
+    return _sec_get_json(f"https://data.sec.gov/api/xbrl/companyfacts/CIK{normalized_cik}.json")
+
+
+def get_company_facts(ticker: str) -> Dict[str, Any]:
+    return get_company_facts_by_cik(_ticker_to_cik(ticker))
+
 def _latest_10k_url_for_cik(cik: str) -> str:
-    sub = requests.get(f"https://data.sec.gov/submissions/CIK{cik}.json", headers=UA).json()
+    sub = _sec_get_json(f"https://data.sec.gov/submissions/CIK{cik}.json")
     recent = sub["filings"]["recent"]
     for i, form in enumerate(recent["form"]):
         if form == "10-K":
@@ -23,6 +54,10 @@ def _latest_10k_url_for_cik(cik: str) -> str:
 
 def _clean_html_to_text(html: str) -> str:
     # 1) Parse
+    try:
+        from bs4 import BeautifulSoup
+    except ImportError as exc:
+        raise RuntimeError("beautifulsoup4 is required to parse 10-K HTML") from exc
     soup = BeautifulSoup(html, features = 'xml')
 
     # 2) Drop non-content elements

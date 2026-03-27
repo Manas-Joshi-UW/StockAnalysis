@@ -30,6 +30,7 @@ import numpy as np
 import pandas as pd
 import torch
 from torch import nn
+from torch.nn import functional as F
 from torch.utils.data import DataLoader, Dataset
 
 PRICE_HISTORY_DIR = "price_history"
@@ -50,6 +51,7 @@ MODEL_OUTPUT = "stock_autoencoder.pt"
 METRICS_OUTPUT = "stock_autoencoder_metrics.json"
 EMBEDDINGS_OUTPUT = "stock_embeddings.json"
 SIMILARITY_OUTPUT = "autoencoder_similar_stocks.json"
+CORRELATION_EPS = 1e-8
 
 
 @dataclass
@@ -276,8 +278,17 @@ class StockAutoencoder(nn.Module):
         return self.encoder(x)
 
 
-def l2_reconstruction_loss(reconstructed: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-    return torch.linalg.vector_norm(reconstructed - target, ord=2, dim=1).mean()
+def correlation_reconstruction_loss(reconstructed: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    # Pearson correlation is cosine similarity after mean-centering each window.
+    reconstructed_centered = reconstructed - reconstructed.mean(dim=1, keepdim=True)
+    target_centered = target - target.mean(dim=1, keepdim=True)
+    correlation = F.cosine_similarity(
+        reconstructed_centered,
+        target_centered,
+        dim=1,
+        eps=CORRELATION_EPS,
+    )
+    return (1.0 - correlation).mean()
 
 
 def build_loader(dataset: Dataset, batch_size: int, shuffle: bool, seed: int) -> DataLoader:
@@ -310,7 +321,7 @@ def run_epoch(
         for batch in loader:
             batch = batch.to(device)
             reconstructed = model(batch)
-            loss = l2_reconstruction_loss(reconstructed, batch)
+            loss = correlation_reconstruction_loss(reconstructed, batch)
 
             if is_training:
                 optimizer.zero_grad(set_to_none=True)
@@ -346,7 +357,7 @@ def train_model(
 
         history["train_loss"].append(train_loss)
         history["val_loss"].append(val_loss)
-        print(f"Epoch {epoch:02d}/{epochs} | train_l2={train_loss:.6f} | val_l2={val_loss:.6f}")
+        print(f"Epoch {epoch:02d}/{epochs} | train_corr_loss={train_loss:.6f} | val_corr_loss={val_loss:.6f}")
 
         if not math.isnan(val_loss) and val_loss < best_val_loss:
             best_val_loss = val_loss
@@ -407,12 +418,16 @@ def compute_stock_embeddings(
                 batch = torch.from_numpy(windows[start_idx : start_idx + batch_size]).to(device)
                 reconstructed.append(model(batch).cpu())
             reconstructed_tensor = torch.cat(reconstructed, dim=0) if reconstructed else torch.empty((0, WINDOW_SIZE))
-            error = l2_reconstruction_loss(reconstructed_tensor, torch.from_numpy(windows)).item() if len(windows) else math.nan
+            error = (
+                correlation_reconstruction_loss(reconstructed_tensor, torch.from_numpy(windows)).item()
+                if len(windows)
+                else math.nan
+            )
 
         mean_embedding = latent.mean(axis=0) if len(latent) else np.zeros(LATENT_DIM, dtype=np.float32)
         embeddings[record.ticker] = {
             "num_windows": int(record.total_windows),
-            "reconstruction_l2": float(error),
+            "reconstruction_loss": float(error),
             "embedding": [float(x) for x in mean_embedding],
         }
 
@@ -522,7 +537,7 @@ def main() -> None:
     )
 
     test_loss = evaluate_model(model, test_loader, device=device) if len(test_dataset) else math.nan
-    print(f"Test L2 reconstruction loss: {test_loss:.6f}")
+    print(f"Test correlation reconstruction loss: {test_loss:.6f}")
 
     checkpoint_path = base_dir / MODEL_OUTPUT
     torch.save(
@@ -547,7 +562,8 @@ def main() -> None:
 
     metrics_payload = {
         "history": history,
-        "test_l2": test_loss,
+        "test_loss": test_loss,
+        "loss_name": "1 - pearson_correlation",
         "dataset_summary": dataset_summary,
         "window_size": WINDOW_SIZE,
         "architecture": [50, 32, 16, 8, 16, 32, 50],
