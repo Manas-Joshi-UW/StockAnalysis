@@ -14,3 +14,6 @@ autoencoder_similar_stocks.json
 stock_embeddings.json
 stock_autoencoder.pt
 stock_autoencoder_metrics.json
+umap_projection.json
+beta_allowlist.txt
+beta_waitlist.csv
