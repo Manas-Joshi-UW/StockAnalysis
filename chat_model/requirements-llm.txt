@@ -1,0 +1,15 @@
+# Requirements for the isolated LLM venv (chat_model/.venv_llm)
+# Install with:
+#   pip install -r chat_model/requirements-llm.txt
+#
+# For CPU-only inference that is what this file installs.
+# For CUDA acceleration see the comments in start_chat_service.ps1.
+
+flask>=2.3.0
+python-dotenv>=1.0.0
+
+# CPU-only llama-cpp-python.
+# Replace with the CUDA wheel if you have a compatible GPU + CUDA toolkit:
+#   pip install llama-cpp-python \
+#       --extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cu124
+llama-cpp-python
