@@ -24,7 +24,7 @@ def summarize_10k(text: str) -> str:
     return completion.choices[0].message.content
 
 def get_10k_from_ticker(ticker: str) -> str:
-    with open(f"10k_text/{ticker}.txt", "r", encoding="utf-8") as f:
+    with open(f"FormData/10k_text/{ticker}.txt", "r", encoding="utf-8") as f:
         text = f.read()
     return text
 
@@ -92,6 +92,15 @@ if __name__ == "__main__":
         print(f"{section['item']}  —  {len(section['text']):,} chars")
         print("-" * 100)
     sections = filter_sections(sections)
-    print(f"\n{len(sections)} sections after filtering (>2000 chars)")
-    print("This is the business section:")
-    print(sections["ITEM 1."]["text"])                             
+    for key, section in sections.items():
+        print(key)
+        print(len(section["text"]))
+        if len(section["text"]) > 20000:
+            print(f"Section {key} is too long, skipping")
+            continue
+
+    # print(f"\n{len(sections)} sections after filtering (>2000 chars)")
+    # print("This is the business section summary:")
+    total_string = "Summarize the following 10k section, just provide the summary, highlighting the products, competitive advantages, etc., no other text: " + sections["ITEM 1."]["text"][:16000]
+    # summarize the business section
+    # print(summarize_10k(total_string))
