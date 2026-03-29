@@ -2190,12 +2190,8 @@ def _build_chat_shell():
                         ],
                         id="chat-panel-header",
                     ),
-                    # Message area (wrapped in dcc.Loading for spinner)
-                    dcc.Loading(
-                        html.Div([], id="chat-messages"),
-                        type="circle",
-                        color="#2563eb",
-                    ),
+                    # Message area — plain div; spinner is rendered inside by the callback
+                    html.Div([], id="chat-messages"),
                     # Input row
                     html.Div(
                         [
@@ -3538,6 +3534,21 @@ def toggle_chat_panel(bubble_clicks, close_clicks, is_open):
     return ("chat-panel--open" if new_open else ""), new_open
 
 
+def _render_bubbles(history: list, error_text: Optional[str] = None) -> list:
+    """Turn a history list into Dash bubble components."""
+    bubbles = []
+    for msg in history:
+        role = msg.get("role", "")
+        content = msg.get("content", "")
+        if role == "system":
+            continue
+        css = "chat-msg chat-msg--user" if role == "user" else "chat-msg chat-msg--assistant"
+        bubbles.append(html.Div(content, className=css))
+    if error_text:
+        bubbles.append(html.Div(error_text, className="chat-msg chat-msg--error"))
+    return bubbles
+
+
 @app.callback(
     Output("chat-messages", "children"),
     Output("chat-history", "data"),
@@ -3548,12 +3559,10 @@ def toggle_chat_panel(bubble_clicks, close_clicks, is_open):
     prevent_initial_call=True,
 )
 def send_chat_message(n_clicks, user_text, history):
-    if not user_text or not user_text.strip():
+    if not n_clicks or not user_text or not user_text.strip():
         raise dash.exceptions.PreventUpdate
 
     user_text = user_text.strip()
-
-    # Append user message to history
     history = list(history or [])
     history.append({"role": "user", "content": user_text})
 
@@ -3584,20 +3593,7 @@ def send_chat_message(n_clicks, user_text, history):
     if assistant_text:
         history.append({"role": "assistant", "content": assistant_text})
 
-    # Build message bubbles
-    bubbles = []
-    for msg in history:
-        role = msg.get("role", "")
-        content = msg.get("content", "")
-        if role == "system":
-            continue
-        css_class = "chat-msg chat-msg--user" if role == "user" else "chat-msg chat-msg--assistant"
-        bubbles.append(html.Div(content, className=css_class))
-
-    if error_text:
-        bubbles.append(html.Div(error_text, className="chat-msg chat-msg--error"))
-
-    return bubbles, history, ""
+    return _render_bubbles(history, error_text), history, ""
 
 
 # ------------------------------------------------------------
