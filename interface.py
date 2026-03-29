@@ -19,6 +19,7 @@ import threading
 from datetime import datetime, timedelta
 from typing import List, Dict, Optional
 from urllib.parse import quote
+import requests as _requests
 
 import numpy as np
 import pandas as pd
@@ -89,6 +90,9 @@ def _env_value(*names: str, default: Optional[str] = None) -> Optional[str]:
 
 
 _load_local_env_file()
+
+CHAT_SERVICE_URL: str = _env_value("CHAT_SERVICE_URL", default="http://127.0.0.1:8001")
+_CHAT_TIMEOUT: int = 60  # seconds before we give up waiting for the model
 
 
 def _load_listing_name_map() -> Dict[str, str]:
@@ -2159,12 +2163,68 @@ def logout():
     return redirect(next_path)
 
 
+def _build_chat_shell():
+    """Fixed chat bubble + slide-up panel, rendered once at the top level."""
+    return html.Div(
+        [
+            # ── Stores ──────────────────────────────────────────────────────
+            dcc.Store(id="chat-open", data=False),
+            dcc.Store(id="chat-history", data=[]),
+
+            # ── Floating bubble button ───────────────────────────────────
+            html.Button(
+                "💬",
+                id="chat-bubble-btn",
+                title="Open finance assistant",
+                n_clicks=0,
+            ),
+
+            # ── Slide-up panel ───────────────────────────────────────────
+            html.Div(
+                [
+                    # Header
+                    html.Div(
+                        [
+                            html.P("Finance Assistant", id="chat-panel-title"),
+                            html.Button("✕", id="chat-close-btn", n_clicks=0),
+                        ],
+                        id="chat-panel-header",
+                    ),
+                    # Message area (wrapped in dcc.Loading for spinner)
+                    dcc.Loading(
+                        html.Div([], id="chat-messages"),
+                        type="circle",
+                        color="#2563eb",
+                    ),
+                    # Input row
+                    html.Div(
+                        [
+                            dcc.Textarea(
+                                id="chat-input",
+                                placeholder="Ask about a stock or company…",
+                                rows=1,
+                            ),
+                            html.Button("➤", id="chat-send-btn", n_clicks=0),
+                        ],
+                        id="chat-input-row",
+                    ),
+                ],
+                id="chat-panel",
+                className="",
+            ),
+        ],
+        id="chat-shell",
+        style={"position": "fixed", "zIndex": 1100},
+    )
+
+
 def serve_layout():
     if _current_user_is_allowed():
         return html.Div(
             [
                 dcc.Location(id="url", refresh=False),
                 html.Div(id="page-content"),
+                _build_chat_shell(),
             ]
         )
     return build_beta_gate_page()
@@ -3455,6 +3515,89 @@ def get_tickers_below_50w_ma() -> List[str]:
         except Exception:
             continue
     return sorted(out)
+
+
+# ------------------------------------------------------------
+# Chat callbacks
+# ------------------------------------------------------------
+
+@app.callback(
+    Output("chat-panel", "className"),
+    Output("chat-open", "data"),
+    Input("chat-bubble-btn", "n_clicks"),
+    Input("chat-close-btn", "n_clicks"),
+    State("chat-open", "data"),
+    prevent_initial_call=True,
+)
+def toggle_chat_panel(bubble_clicks, close_clicks, is_open):
+    triggered = ctx.triggered_id
+    if triggered == "chat-close-btn":
+        return "", False
+    # bubble button toggles
+    new_open = not is_open
+    return ("chat-panel--open" if new_open else ""), new_open
+
+
+@app.callback(
+    Output("chat-messages", "children"),
+    Output("chat-history", "data"),
+    Output("chat-input", "value"),
+    Input("chat-send-btn", "n_clicks"),
+    State("chat-input", "value"),
+    State("chat-history", "data"),
+    prevent_initial_call=True,
+)
+def send_chat_message(n_clicks, user_text, history):
+    if not user_text or not user_text.strip():
+        raise dash.exceptions.PreventUpdate
+
+    user_text = user_text.strip()
+
+    # Append user message to history
+    history = list(history or [])
+    history.append({"role": "user", "content": user_text})
+
+    # Call the chat microservice
+    assistant_text: Optional[str] = None
+    error_text: Optional[str] = None
+    try:
+        resp = _requests.post(
+            f"{CHAT_SERVICE_URL}/chat",
+            json={"messages": history},
+            timeout=_CHAT_TIMEOUT,
+        )
+        if resp.ok:
+            data = resp.json()
+            assistant_text = data.get("response") or data.get("error") or "No response."
+        else:
+            error_text = f"Service error {resp.status_code}: {resp.text[:200]}"
+    except _requests.exceptions.ConnectionError:
+        error_text = (
+            "Could not reach the finance assistant. "
+            "Make sure the chat service is running (start_chat_service.ps1)."
+        )
+    except _requests.exceptions.Timeout:
+        error_text = "The model took too long to respond. Try a shorter question."
+    except Exception as exc:  # noqa: BLE001
+        error_text = f"Unexpected error: {exc}"
+
+    if assistant_text:
+        history.append({"role": "assistant", "content": assistant_text})
+
+    # Build message bubbles
+    bubbles = []
+    for msg in history:
+        role = msg.get("role", "")
+        content = msg.get("content", "")
+        if role == "system":
+            continue
+        css_class = "chat-msg chat-msg--user" if role == "user" else "chat-msg chat-msg--assistant"
+        bubbles.append(html.Div(content, className=css_class))
+
+    if error_text:
+        bubbles.append(html.Div(error_text, className="chat-msg chat-msg--error"))
+
+    return bubbles, history, ""
 
 
 # ------------------------------------------------------------
