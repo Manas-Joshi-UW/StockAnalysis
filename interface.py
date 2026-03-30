@@ -2170,6 +2170,7 @@ def _build_chat_shell():
             # ── Stores ──────────────────────────────────────────────────────
             dcc.Store(id="chat-open", data=False),
             dcc.Store(id="chat-history", data=[]),
+            dcc.Store(id="chat-pending", data=""),
 
             # ── Floating bubble button ───────────────────────────────────
             html.Button(
@@ -2190,15 +2191,17 @@ def _build_chat_shell():
                         ],
                         id="chat-panel-header",
                     ),
-                    # Message area — plain div; spinner is rendered inside by the callback
+                    # Message area
                     html.Div([], id="chat-messages"),
-                    # Input row
+                    # Input row — dcc.Input so Enter key fires n_submit
                     html.Div(
                         [
-                            dcc.Textarea(
+                            dcc.Input(
                                 id="chat-input",
+                                type="text",
                                 placeholder="Ask about a stock or company…",
-                                rows=1,
+                                debounce=False,
+                                n_submit=0,
                             ),
                             html.Button("➤", id="chat-send-btn", n_clicks=0),
                         ],
@@ -3534,7 +3537,8 @@ def toggle_chat_panel(bubble_clicks, close_clicks, is_open):
     return ("chat-panel--open" if new_open else ""), new_open
 
 
-def _render_bubbles(history: list, error_text: Optional[str] = None) -> list:
+def _render_bubbles(history: list, error_text: Optional[str] = None,
+                    typing: bool = False) -> list:
     """Turn a history list into Dash bubble components."""
     bubbles = []
     for msg in history:
@@ -3546,25 +3550,93 @@ def _render_bubbles(history: list, error_text: Optional[str] = None) -> list:
         bubbles.append(html.Div(content, className=css))
     if error_text:
         bubbles.append(html.Div(error_text, className="chat-msg chat-msg--error"))
+    if typing:
+        bubbles.append(
+            html.Div(
+                [html.Span(), html.Span(), html.Span()],
+                className="chat-typing",
+            )
+        )
     return bubbles
 
 
-@app.callback(
+# ── Phase 1: clientside — fires instantly on Send click or Enter key ──
+#    Clears the input, appends the user bubble, shows typing dots,
+#    and writes the pending text to chat-pending so Phase 2 picks it up.
+app.clientside_callback(
+    """
+    function(nClicks, nSubmit, inputVal, history) {
+        if (!inputVal || !inputVal.trim()) {
+            return [
+                window.dash_clientside.no_update,
+                window.dash_clientside.no_update,
+                window.dash_clientside.no_update,
+                window.dash_clientside.no_update
+            ];
+        }
+        var text = inputVal.trim();
+        var newHistory = (history || []).concat([{role: "user", content: text}]);
+
+        // Build bubble components as Dash JSON
+        var bubbles = [];
+        for (var i = 0; i < newHistory.length; i++) {
+            var msg = newHistory[i];
+            if (msg.role === "system") continue;
+            bubbles.push({
+                type: "Div",
+                namespace: "dash_html_components",
+                props: {
+                    children: msg.content,
+                    className: msg.role === "user"
+                        ? "chat-msg chat-msg--user"
+                        : "chat-msg chat-msg--assistant"
+                }
+            });
+        }
+        // Typing indicator dots
+        bubbles.push({
+            type: "Div",
+            namespace: "dash_html_components",
+            props: {
+                className: "chat-typing",
+                children: [
+                    {type: "Span", namespace: "dash_html_components", props: {}},
+                    {type: "Span", namespace: "dash_html_components", props: {}},
+                    {type: "Span", namespace: "dash_html_components", props: {}}
+                ]
+            }
+        });
+
+        return [bubbles, newHistory, "", text];
+    }
+    """,
     Output("chat-messages", "children"),
     Output("chat-history", "data"),
     Output("chat-input", "value"),
+    Output("chat-pending", "data"),
     Input("chat-send-btn", "n_clicks"),
+    Input("chat-input", "n_submit"),
     State("chat-input", "value"),
     State("chat-history", "data"),
     prevent_initial_call=True,
 )
-def send_chat_message(n_clicks, user_text, history):
-    if not n_clicks or not user_text or not user_text.strip():
+
+
+# ── Phase 2: server-side — triggered when chat-pending is set ──
+#    Calls the LLM, replaces the typing dots with the real response.
+@app.callback(
+    Output("chat-messages", "children", allow_duplicate=True),
+    Output("chat-history", "data", allow_duplicate=True),
+    Output("chat-pending", "data", allow_duplicate=True),
+    Input("chat-pending", "data"),
+    State("chat-history", "data"),
+    prevent_initial_call=True,
+)
+def process_chat_response(pending_text, history):
+    if not pending_text:
         raise dash.exceptions.PreventUpdate
 
-    user_text = user_text.strip()
     history = list(history or [])
-    history.append({"role": "user", "content": user_text})
 
     # Call the chat microservice
     assistant_text: Optional[str] = None
