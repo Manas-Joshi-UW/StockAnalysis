@@ -184,7 +184,6 @@
 
 #chat-input {
   flex: 1 1 auto;
-  resize: none;
   border: 1px solid #cbd5e1;
   border-radius: 8px;
   padding: 7px 10px;
@@ -194,8 +193,8 @@
   background: #fff;
   outline: none;
   transition: border-color 0.15s;
-  min-height: 36px;
-  max-height: 80px;
+  height: 36px;
+  min-width: 0;
 }
 
 #chat-input:focus {
