@@ -1,7 +1,11 @@
+import os
 import re
+import time
+from datetime import datetime, timezone
 from functools import lru_cache
-from typing import Any, Dict
+from typing import Any, Dict, List
 
+import pandas as pd
 import requests
 
 UA = {"User-Agent": "Manas Joshi joshi.manas01@gmail.com"}  # SEC requires a descriptive UA
@@ -130,13 +134,119 @@ def extract_10k_section(full_text: str, key: str) -> str:
     section = full_text[start:end].strip()
     return section
 
+RETRIEVAL_LOG = "10k_retrieval_log.csv"
+
+
+def _load_retrieval_log(log_path: str) -> pd.DataFrame:
+    if os.path.exists(log_path):
+        return pd.read_csv(log_path, parse_dates=["last_date_of_retrieval"])
+    return pd.DataFrame(columns=["ticker", "last_date_of_retrieval", "status"])
+
+
+def _save_retrieval_log(df: pd.DataFrame, log_path: str) -> None:
+    df.to_csv(log_path, index=False)
+
+
+def get_tickers_from_price_history(price_history_dir: str = "price_history") -> List[str]:
+    """Return sorted list of tickers that have a parquet file in price_history_dir."""
+    if not os.path.isdir(price_history_dir):
+        raise FileNotFoundError(f"Directory not found: {price_history_dir}")
+    return sorted(
+        f[:-len(".parquet")].upper()
+        for f in os.listdir(price_history_dir)
+        if f.endswith(".parquet")
+    )
+
+
+def get_10k_for_tickers(
+    tickers: List[str],
+    output_dir: str = "10k_text",
+    log_path: str = RETRIEVAL_LOG,
+    delay: float = 0.5,
+    skip_already_logged: bool = True,
+) -> pd.DataFrame:
+    """
+    Fetch and save 10-K filings for a list of tickers, tracking retrieval in a CSV log.
+
+    Args:
+        tickers:            List of ticker symbols.
+        output_dir:         Directory to save <TICKER>.txt files.
+        log_path:           Path to the CSV tracking file.
+        delay:              Seconds to wait between SEC requests.
+        skip_already_logged: Skip tickers that already have a successful entry in the log.
+
+    Returns:
+        Updated retrieval log as a DataFrame (also saved to log_path).
+    """
+    os.makedirs(output_dir, exist_ok=True)
+    log = _load_retrieval_log(log_path)
+
+    already_done: set = set()
+    if skip_already_logged:
+        already_done = set(
+            log.loc[log["status"] == "ok", "ticker"].str.upper().tolist()
+        )
+
+    new_rows = []
+    for ticker in tickers:
+        ticker = str(ticker).strip().upper()
+
+        if ticker in already_done:
+            print(f"[skip] {ticker} — already in log")
+            continue
+
+        out_path = os.path.join(output_dir, f"{ticker}.txt")
+        try:
+            text = get_latest_10k_text(ticker)
+            with open(out_path, "w", encoding="utf-8") as f:
+                f.write(text)
+            status = "ok"
+            print(f"[ok]   {ticker}")
+        except Exception as exc:
+            status = str(exc)
+            print(f"[err]  {ticker}: {status}")
+
+        new_rows.append({
+            "ticker": ticker,
+            "last_date_of_retrieval": datetime.now(timezone.utc).isoformat(),
+            "status": status,
+        })
+        _save_retrieval_log(
+            pd.concat([log, pd.DataFrame(new_rows)], ignore_index=True),
+            log_path,
+        )
+        time.sleep(delay)
+
+    updated_log = pd.concat([log, pd.DataFrame(new_rows)], ignore_index=True)
+    _save_retrieval_log(updated_log, log_path)
+    return updated_log
+
+
+def fetch_all_10ks_from_price_history(
+    price_history_dir: str = "price_history",
+    output_dir: str = "10k_text",
+    log_path: str = RETRIEVAL_LOG,
+    delay: float = 0.5,
+) -> pd.DataFrame:
+    """
+    Convenience wrapper: discovers tickers from price_history_dir and fetches
+    10-K filings for any not already in the retrieval log.
+
+    Returns the updated retrieval log DataFrame.
+    """
+    tickers = get_tickers_from_price_history(price_history_dir)
+    print(f"Found {len(tickers)} tickers in {price_history_dir}/")
+    return get_10k_for_tickers(
+        tickers,
+        output_dir=output_dir,
+        log_path=log_path,
+        delay=delay,
+        skip_already_logged=True,
+    )
+
+
 # ------------------ Example usage ------------------
 if __name__ == "__main__":
-    import os
-    ticker = "ABCL" 
-    text = get_latest_10k_text(ticker)
-    # save the text to a folder directory called 10k_text
-    os.makedirs("10k_text", exist_ok=True)
-    with open(f"10k_text/{ticker}.txt", "w", encoding="utf-8") as f:
-        f.write(text)
-    print(text[:2000])
+    log = fetch_all_10ks_from_price_history()
+    print(f"\nDone. Log saved to {RETRIEVAL_LOG}")
+    print(log["status"].value_counts().to_string())
