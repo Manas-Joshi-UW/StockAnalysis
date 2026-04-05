@@ -62,7 +62,15 @@ def _clean_html_to_text(html: str) -> str:
         from bs4 import BeautifulSoup
     except ImportError as exc:
         raise RuntimeError("beautifulsoup4 is required to parse 10-K HTML") from exc
-    soup = BeautifulSoup(html, features = 'xml')
+    # Prefer lxml for speed; fall back to the stdlib html.parser (always available)
+    for parser in ("lxml", "html.parser"):
+        try:
+            soup = BeautifulSoup(html, features=parser)
+            break
+        except Exception:
+            continue
+    else:
+        raise RuntimeError("No suitable HTML parser found. Install lxml: pip install lxml")
 
     # 2) Drop non-content elements
     for tag in soup(["script", "style", "noscript", "header", "footer"]):

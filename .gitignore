@@ -17,3 +17,5 @@ stock_autoencoder_metrics.json
 umap_projection.json
 beta_allowlist.txt
 beta_waitlist.csv
+10k_text/*.txt
+10k_retrieval_log.csv
