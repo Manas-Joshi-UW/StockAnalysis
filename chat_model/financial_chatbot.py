@@ -14,20 +14,28 @@ from __future__ import annotations
 
 import os
 import threading
-from typing import Optional
+
+
+def _resolve_model_path() -> str:
+    """Full path to the GGUF file: MODEL_PATH, or LLM_MODEL_PATH relative to this package."""
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    override = os.environ.get("MODEL_PATH")
+    if override:
+        return override
+    name = (os.environ.get("LLM_MODEL_PATH") or "").strip()
+    if not name:
+        raise RuntimeError(
+            "Set LLM_MODEL_PATH in .env (GGUF filename in chat_model/) "
+            "or MODEL_PATH to an absolute path."
+        )
+    return name if os.path.isabs(name) else os.path.join(base_dir, name)
+
 
 # ---------------------------------------------------------------------------
-# Config — override via environment variables or .env before importing
+# Config — set LLM_MODEL_PATH / MODEL_PATH in .env before importing (see chat_service._load_env)
 # ---------------------------------------------------------------------------
 
-# Absolute path to the GGUF model file.
-# Defaults to a path relative to this file; set MODEL_PATH env var to override.
-_DEFAULT_MODEL_PATH = os.path.join(
-    os.path.dirname(os.path.abspath(__file__)),
-    "Llama-3-8B-Instruct-Finance-RAG.Q8_0.gguf",
-)
-
-MODEL_PATH: str = os.environ.get("MODEL_PATH", _DEFAULT_MODEL_PATH)
+MODEL_PATH: str = _resolve_model_path()
 
 # How many layers to offload to GPU (0 = CPU-only).
 N_GPU_LAYERS: int = int(os.environ.get("N_GPU_LAYERS", "35"))
@@ -68,7 +76,7 @@ def get_llm():
         if not os.path.isfile(MODEL_PATH):
             raise FileNotFoundError(
                 f"GGUF model not found at: {MODEL_PATH}\n"
-                "Set the MODEL_PATH environment variable to the correct path."
+                "Check LLM_MODEL_PATH or MODEL_PATH in .env."
             )
 
         print(f"[chatbot] Loading model from {MODEL_PATH} "
