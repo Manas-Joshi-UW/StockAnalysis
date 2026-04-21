@@ -25,9 +25,11 @@ $VenvPython = Join-Path $ScriptDir "chat_model\.venv_llm\Scripts\python.exe"
 $ServiceScript = Join-Path $ScriptDir "chat_model\chat_service.py"
 
 if (-not (Test-Path $VenvPython)) {
-    Write-Error "LLM venv not found at $VenvPython`nCreate it first — see the setup instructions at the top of this script."
+    $msg = "LLM venv not found at $VenvPython`n" +
+        "Create it first - see the setup instructions at the top of this script."
+    Write-Error $msg
     exit 1
 }
 
-Write-Host "[chat_service] Starting with venv: $VenvPython" -ForegroundColor Cyan
+Write-Host ('[chat_service] Starting with venv: ' + $VenvPython) -ForegroundColor Cyan
 & $VenvPython $ServiceScript

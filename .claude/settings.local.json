@@ -1,7 +1,9 @@
 {
   "permissions": {
     "allow": [
-      "Bash(python precompute_umap.py)"
+      "Bash(python precompute_umap.py)",
+      "Bash(python -c \"import pandas as pd; df = pd.read_parquet\\('price_history/AAPL.parquet'\\); print\\('SHAPE:', df.shape\\); print\\('DTYPES:'\\); print\\(df.dtypes\\); print\\('INDEX:', df.index.name, type\\(df.index\\).__name__\\); print\\('COLS:', df.columns.tolist\\(\\)\\); print\\('HEAD:'\\); print\\(df.head\\(2\\)\\); print\\('TAIL:'\\); print\\(df.tail\\(2\\)\\)\")",
+      "Bash(python -c ' *)"
     ]
   }
 }
