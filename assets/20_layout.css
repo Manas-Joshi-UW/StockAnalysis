@@ -1,0 +1,232 @@
+/* ============================================================
+   Stocks Explorer — layout, watchlist tray/table, daily summary,
+   alerts editor, and responsive rules
+   ============================================================ */
+
+/* Generic safety: Plotly graphs must never overflow their parent. */
+.js-plotly-plot,
+.plot-container,
+.dash-graph,
+.svg-container {
+  max-width: 100%;
+}
+
+/* ── Watchlist tray ───────────────────────────────────────── */
+.watchlist-chip {
+  transition: background 0.15s, border-color 0.15s, color 0.15s;
+  /* Allow shrinkage so chips wrap on a narrow viewport. */
+  min-width: 0;
+}
+
+.watchlist-chip:hover {
+  border-color: #98a2b3;
+}
+
+.watchlist-chip--primary:hover {
+  background: #1d2939;
+  border-color: #1d2939;
+}
+
+.watchlist-chip button {
+  color: inherit;
+  background: transparent;
+}
+
+.watchlist-chip button:hover {
+  opacity: 0.85;
+  text-decoration: underline;
+}
+
+/* When the watchlist has many tickers, allow the chip rail to scroll
+   horizontally on cramped screens rather than pushing other UI down. */
+.watchlist-chips {
+  overflow-x: auto;
+  scrollbar-width: thin;
+}
+
+.watchlist-quick-add-input:focus {
+  border-color: #2563eb;
+  box-shadow: 0 0 0 2px rgba(37, 99, 235, 0.15);
+}
+
+.watchlist-quick-add-btn:hover {
+  background: #1d2939;
+}
+
+/* ── Watchlist table ──────────────────────────────────────── */
+.watchlist-table-card {
+  /* DataTable provides its own scroll wrapper; ensure we don't double-scroll. */
+  overflow: hidden;
+}
+
+.watchlist-table-card .dash-table-container {
+  font-family: inherit;
+}
+
+.watchlist-table-card .dash-spreadsheet-container {
+  font-size: 12px;
+}
+
+.watchlist-table-card .dash-spreadsheet-container .dash-cell-value {
+  white-space: normal !important;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.watchlist-table-card .dash-spreadsheet-container .Select-control {
+  font-size: 12px;
+  min-height: 28px;
+  height: 28px;
+}
+
+.watchlist-table-card .dash-spreadsheet-container input {
+  font-size: 12px !important;
+}
+
+.watchlist-table-card .dash-spreadsheet-container .dash-filter input {
+  height: 24px;
+}
+
+.watchlist-table-toolbar {
+  align-items: flex-end;
+}
+
+/* ── Daily summary tiles ──────────────────────────────────── */
+.watchlist-summary-grid > div:hover {
+  border-color: #b6c2d1;
+}
+
+/* ── Alerts panel ─────────────────────────────────────────── */
+.alerts-form .Select-control {
+  height: 32px;
+  min-height: 32px;
+  font-size: 13px;
+}
+
+/* ── Discovery tabs ───────────────────────────────────────── */
+.discovery-card .tab {
+  font-weight: 600;
+}
+
+.discovery-card .tab--selected {
+  border-top: 2px solid #101828 !important;
+  color: #101828 !important;
+}
+
+/* ── Section headers ──────────────────────────────────────── */
+.section-header h2 {
+  margin: 0;
+}
+
+/* ── Mobile (≤ 720px) ─────────────────────────────────────── */
+@media (max-width: 720px) {
+  .page-container {
+    padding: 10px !important;
+    gap: 10px !important;
+  }
+
+  /* Stack control row vertically. */
+  .control-row {
+    flex-direction: column !important;
+    align-items: stretch !important;
+  }
+
+  .control-row > div {
+    flex: 1 1 100% !important;
+    min-width: 0 !important;
+  }
+
+  .controls-stack {
+    gap: 10px !important;
+  }
+
+  /* Tighter price summary cards on mobile. */
+  .price-summary {
+    grid-template-columns: repeat(2, minmax(0, 1fr)) !important;
+    gap: 6px !important;
+  }
+
+  /* Tighter chip wrapping; force horizontal scroll if rail still overflows. */
+  .watchlist-chips {
+    gap: 6px !important;
+    flex-wrap: nowrap !important;
+    overflow-x: auto !important;
+    padding-bottom: 4px;
+  }
+
+  .watchlist-chip {
+    font-size: 12px !important;
+    flex: 0 0 auto;
+  }
+
+  .watchlist-quick-add-row {
+    flex-wrap: wrap !important;
+  }
+
+  /* Cards: tighter padding. */
+  .card,
+  .price-chart-card,
+  .overview-card,
+  .discovery-card,
+  .watchlist-tray,
+  .watchlist-table-card,
+  .watchlist-summary,
+  .alerts-panel {
+    padding: 10px !important;
+    border-radius: 10px !important;
+  }
+
+  .price-chart-card .js-plotly-plot,
+  .price-chart-card .plotly-graph-div {
+    min-height: 280px;
+  }
+
+  .overview-card .js-plotly-plot,
+  .overview-card .plotly-graph-div {
+    min-height: 240px;
+  }
+
+  /* Daily summary collapses to single column on phones. */
+  .watchlist-summary-grid {
+    grid-template-columns: 1fr !important;
+  }
+
+  /* Watchlist toolbar stacks. */
+  .watchlist-table-toolbar {
+    flex-direction: column !important;
+    align-items: stretch !important;
+  }
+
+  .watchlist-table-toolbar > div {
+    width: 100%;
+  }
+
+  /* DataTable: rely on horizontal scroll. */
+  .watchlist-table-card .dash-spreadsheet-container {
+    overflow-x: auto;
+  }
+
+  /* Section header titles a touch smaller. */
+  .section-header h2 {
+    font-size: 13px !important;
+  }
+
+  /* Alerts form collapses to single column on phones. */
+  .alerts-form {
+    grid-template-columns: 1fr !important;
+  }
+}
+
+/* ── Tablet (721px – 960px) ───────────────────────────────── */
+@media (min-width: 721px) and (max-width: 960px) {
+  .price-summary {
+    grid-template-columns: repeat(3, minmax(0, 1fr)) !important;
+  }
+}
+
+/* ── Wide screens (≥ 961px): two-column overview ──────────── */
+@media (min-width: 961px) {
+  .overview-grid {
+    grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) !important;
+  }
+}
