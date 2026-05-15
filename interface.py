@@ -27,7 +27,7 @@ import yfinance as yf
 import plotly.graph_objects as go
 import umap
 from authlib.integrations.flask_client import OAuth
-from dash import Dash, dcc, html, Input, Output, State, ctx, ALL
+from dash import Dash, dcc, html, Input, Output, State, ctx, ALL, dash_table
 import dash
 from flask import Response, redirect, request, session
 from werkzeug.middleware.proxy_fix import ProxyFix
@@ -495,6 +495,865 @@ def _normalize_symbol_selection(value) -> List[str]:
 def _primary_selected_symbol(value) -> Optional[str]:
     selected_symbols = _normalize_symbol_selection(value)
     return selected_symbols[0] if selected_symbols else None
+
+
+# ------------------------------------------------------------
+# Watchlist state helpers
+#
+# Canonical shape (stored in dcc.Store id="watchlist-store",
+# storage_type="local"):
+#   {
+#       "items": [
+#           {
+#               "ticker": "AAPL",
+#               "company_name": "Apple Inc.",
+#               "notes": "...",
+#               "tags": ["mega cap", "consumer"],
+#               "status": "watching",   # one of WATCHLIST_STATUSES
+#               "date_added": "2026-05-13T19:00:00",
+#               "sort_order": 0,
+#               "alerts": [
+#                   {"type": "price_above", "value": 250.0, "note": ""},
+#                   ...
+#               ],
+#           },
+#           ...
+#       ],
+#       "primary": "AAPL",          # always present in items when items exist
+#       "selected": ["AAPL", ...],  # subset chosen for chart compare mode
+#       "last_updated": "2026-05-13T19:00:00",
+#   }
+# ------------------------------------------------------------
+WATCHLIST_STATUSES = ("new", "researching", "watching", "ready", "rejected")
+WATCHLIST_STATUS_LABELS = {
+    "new": "New",
+    "researching": "Researching",
+    "watching": "Watching",
+    "ready": "Ready",
+    "rejected": "Rejected",
+}
+WATCHLIST_STATUS_COLORS = {
+    "new":         {"bg": "#eff4ff", "fg": "#1e40af", "border": "#c7d2fe"},
+    "researching": {"bg": "#fef3c7", "fg": "#92400e", "border": "#fde68a"},
+    "watching":    {"bg": "#ecfdf5", "fg": "#065f46", "border": "#a7f3d0"},
+    "ready":       {"bg": "#dcfce7", "fg": "#166534", "border": "#86efac"},
+    "rejected":    {"bg": "#f3f4f6", "fg": "#374151", "border": "#d1d5db"},
+}
+WATCHLIST_DEFAULT_STATUS = "new"
+
+WATCHLIST_ALERT_TYPES = (
+    "price_above",
+    "price_below",
+    "percent_move",
+    "crosses_50w_ma",
+    "crosses_200w_ma",
+)
+WATCHLIST_ALERT_LABELS = {
+    "price_above": "Price ≥",
+    "price_below": "Price ≤",
+    "percent_move": "Period |%| ≥",
+    "crosses_50w_ma": "Crosses 50W MA",
+    "crosses_200w_ma": "Crosses 200W MA",
+}
+
+
+def _empty_watchlist_state() -> Dict[str, object]:
+    return {"items": [], "primary": None, "selected": [], "last_updated": None}
+
+
+def _resolve_company_name(symbol: str, fallback: str = "") -> str:
+    sym = str(symbol or "").strip().upper()
+    if not sym:
+        return ""
+    return (
+        str(fallback or "").strip()
+        or LISTING_NAME_MAP.get(sym, "")
+        or DEFAULT_TICKER_NAMES.get(sym, "")
+        or ""
+    )
+
+
+def _normalize_tags(tags) -> List[str]:
+    if isinstance(tags, str):
+        candidates = [t for t in (chunk.strip() for chunk in tags.split(",")) if t]
+    elif isinstance(tags, (list, tuple)):
+        candidates = [str(t or "").strip() for t in tags if str(t or "").strip()]
+    else:
+        candidates = []
+    seen, out = set(), []
+    for tag in candidates:
+        key = tag.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(tag)
+    return out
+
+
+def _normalize_alerts(alerts) -> List[Dict[str, object]]:
+    if not isinstance(alerts, (list, tuple)):
+        return []
+    out: List[Dict[str, object]] = []
+    for entry in alerts:
+        if not isinstance(entry, dict):
+            continue
+        atype = str(entry.get("type") or "").strip().lower()
+        if atype not in WATCHLIST_ALERT_TYPES:
+            continue
+        raw_value = entry.get("value")
+        try:
+            value = float(raw_value) if raw_value is not None and raw_value != "" else None
+        except (TypeError, ValueError):
+            value = None
+        # Crossover alerts don't need a numeric threshold; keep value optional.
+        out.append(
+            {
+                "type": atype,
+                "value": value,
+                "note": str(entry.get("note") or "").strip(),
+            }
+        )
+    return out
+
+
+def _make_watchlist_item(
+    ticker: str,
+    *,
+    company_name: Optional[str] = None,
+    notes: str = "",
+    tags=None,
+    status: str = WATCHLIST_DEFAULT_STATUS,
+    date_added: Optional[str] = None,
+    sort_order: Optional[int] = None,
+    alerts=None,
+) -> Dict[str, object]:
+    symbol = str(ticker or "").strip().upper()
+    cleaned_status = str(status or WATCHLIST_DEFAULT_STATUS).strip().lower()
+    if cleaned_status not in WATCHLIST_STATUSES:
+        cleaned_status = WATCHLIST_DEFAULT_STATUS
+    return {
+        "ticker": symbol,
+        "company_name": _resolve_company_name(symbol, company_name or ""),
+        "notes": str(notes or "").strip(),
+        "tags": _normalize_tags(tags),
+        "status": cleaned_status,
+        "date_added": str(date_added or _timestamp_now()),
+        "sort_order": int(sort_order) if sort_order is not None else 0,
+        "alerts": _normalize_alerts(alerts),
+    }
+
+
+def _normalize_watchlist_state(payload) -> Dict[str, object]:
+    """Coerce any watchlist-store payload into the canonical shape.
+
+    Guarantees:
+      - items are deduped by upper-case ticker
+      - primary is always one of the items' tickers (or None when empty)
+      - selected is a subset of item tickers (defaults to all items when blank)
+      - status falls back to WATCHLIST_DEFAULT_STATUS for unknown values
+    Tolerates legacy payloads that look like the previous workspace shape
+    ({"tickers": [...]}) or raw lists of ticker strings.
+    """
+    if isinstance(payload, list):
+        # Legacy: bare list of ticker strings.
+        payload = {"items": [{"ticker": t} for t in payload]}
+    if not isinstance(payload, dict):
+        payload = {}
+
+    raw_items = payload.get("items")
+    if raw_items is None:
+        # Legacy workspace shape uses "tickers".
+        raw_tickers = payload.get("tickers")
+        if isinstance(raw_tickers, (list, tuple)):
+            raw_items = [{"ticker": t} for t in raw_tickers]
+        else:
+            raw_items = []
+    if not isinstance(raw_items, (list, tuple)):
+        raw_items = []
+
+    items: List[Dict[str, object]] = []
+    seen: set = set()
+    for raw_index, entry in enumerate(raw_items):
+        if isinstance(entry, str):
+            entry = {"ticker": entry}
+        if not isinstance(entry, dict):
+            continue
+        symbol = str(entry.get("ticker") or "").strip().upper()
+        if not symbol or symbol in seen:
+            continue
+        seen.add(symbol)
+        # Default sort_order to the input position so legacy / unannotated
+        # payloads keep their original ordering (Python's sort is stable, but
+        # rows with default 0 would otherwise tie-break unpredictably).
+        raw_sort_order = entry.get("sort_order")
+        if raw_sort_order is None:
+            raw_sort_order = raw_index
+        items.append(
+            _make_watchlist_item(
+                symbol,
+                company_name=entry.get("company_name"),
+                notes=entry.get("notes"),
+                tags=entry.get("tags"),
+                status=entry.get("status"),
+                date_added=entry.get("date_added"),
+                sort_order=raw_sort_order,
+                alerts=entry.get("alerts"),
+            )
+        )
+
+    items.sort(key=lambda i: int(i.get("sort_order") or 0))
+    for index, item in enumerate(items):
+        item["sort_order"] = index
+
+    tickers = [item["ticker"] for item in items]
+
+    raw_primary = payload.get("primary")
+    primary = str(raw_primary or "").strip().upper() or None
+    if primary not in tickers:
+        primary = tickers[0] if tickers else None
+
+    raw_selected = payload.get("selected")
+    if isinstance(raw_selected, (list, tuple)):
+        selected = [
+            t
+            for t in (str(s or "").strip().upper() for s in raw_selected)
+            if t in tickers
+        ]
+        # dedupe while preserving order
+        deduped = []
+        seen_sel: set = set()
+        for t in selected:
+            if t not in seen_sel:
+                seen_sel.add(t)
+                deduped.append(t)
+        selected = deduped
+    else:
+        selected = list(tickers)
+    if not selected and tickers:
+        selected = list(tickers)
+
+    last_updated = str(payload.get("last_updated") or "").strip() or None
+
+    return {
+        "items": items,
+        "primary": primary,
+        "selected": selected,
+        "last_updated": last_updated,
+    }
+
+
+def _watchlist_tickers(state) -> List[str]:
+    return [item["ticker"] for item in state.get("items", [])]
+
+
+def _watchlist_get_item(state, ticker) -> Optional[Dict[str, object]]:
+    symbol = str(ticker or "").strip().upper()
+    for item in state.get("items", []):
+        if item["ticker"] == symbol:
+            return item
+    return None
+
+
+def _watchlist_add(state, ticker, *, set_primary: bool = False) -> Dict[str, object]:
+    state = _normalize_watchlist_state(state)
+    symbol = str(ticker or "").strip().upper()
+    if not symbol:
+        return state
+    existing_tickers = _watchlist_tickers(state)
+    if symbol not in existing_tickers:
+        item = _make_watchlist_item(symbol, sort_order=len(state["items"]))
+        state["items"].append(item)
+    if set_primary or state["primary"] is None:
+        state["primary"] = symbol
+    if symbol not in state["selected"]:
+        state["selected"].append(symbol)
+    state["last_updated"] = _timestamp_now()
+    return state
+
+
+def _watchlist_remove(state, ticker) -> Dict[str, object]:
+    state = _normalize_watchlist_state(state)
+    symbol = str(ticker or "").strip().upper()
+    state["items"] = [item for item in state["items"] if item["ticker"] != symbol]
+    state["selected"] = [t for t in state["selected"] if t != symbol]
+    if state["primary"] == symbol:
+        state["primary"] = state["items"][0]["ticker"] if state["items"] else None
+    state["last_updated"] = _timestamp_now()
+    return state
+
+
+def _watchlist_set_primary(state, ticker) -> Dict[str, object]:
+    state = _normalize_watchlist_state(state)
+    symbol = str(ticker or "").strip().upper()
+    if symbol and symbol in _watchlist_tickers(state):
+        state["primary"] = symbol
+        state["last_updated"] = _timestamp_now()
+    return state
+
+
+def _watchlist_replace_tickers(state, tickers) -> Dict[str, object]:
+    """Reconcile the watchlist with a new ticker order coming from the dropdown.
+
+    Existing items are kept (preserving notes/tags/status/alerts) but reordered
+    to match the new list. Brand-new tickers are added with default values.
+    Removed tickers are dropped.
+    """
+    state = _normalize_watchlist_state(state)
+    new_tickers = _normalize_symbol_selection(tickers)
+    current = _watchlist_tickers(state)
+    if new_tickers == current:
+        return state
+
+    existing = {item["ticker"]: item for item in state["items"]}
+    new_items: List[Dict[str, object]] = []
+    for index, sym in enumerate(new_tickers):
+        if sym in existing:
+            item = dict(existing[sym])
+            item["sort_order"] = index
+            new_items.append(item)
+        else:
+            new_items.append(_make_watchlist_item(sym, sort_order=index))
+
+    state["items"] = new_items
+    state["selected"] = [t for t in state["selected"] if t in new_tickers]
+    if not state["selected"]:
+        state["selected"] = list(new_tickers)
+    if state["primary"] not in new_tickers:
+        state["primary"] = new_tickers[0] if new_tickers else None
+    state["last_updated"] = _timestamp_now()
+    return state
+
+
+def _watchlist_update_item(state, ticker, **fields) -> Dict[str, object]:
+    state = _normalize_watchlist_state(state)
+    symbol = str(ticker or "").strip().upper()
+    for item in state["items"]:
+        if item["ticker"] != symbol:
+            continue
+        if "notes" in fields:
+            item["notes"] = str(fields["notes"] or "").strip()
+        if "tags" in fields:
+            item["tags"] = _normalize_tags(fields["tags"])
+        if "status" in fields:
+            value = str(fields["status"] or WATCHLIST_DEFAULT_STATUS).strip().lower()
+            item["status"] = value if value in WATCHLIST_STATUSES else WATCHLIST_DEFAULT_STATUS
+        if "alerts" in fields:
+            item["alerts"] = _normalize_alerts(fields["alerts"])
+        if "company_name" in fields:
+            item["company_name"] = str(fields["company_name"] or "").strip()
+        state["last_updated"] = _timestamp_now()
+        break
+    return state
+
+
+def _watchlist_set_selected(state, selected_tickers) -> Dict[str, object]:
+    state = _normalize_watchlist_state(state)
+    tickers = _watchlist_tickers(state)
+    cleaned: List[str] = []
+    seen: set = set()
+    for raw in selected_tickers or []:
+        sym = str(raw or "").strip().upper()
+        if sym and sym in tickers and sym not in seen:
+            seen.add(sym)
+            cleaned.append(sym)
+    if not cleaned and tickers:
+        cleaned = list(tickers)
+    state["selected"] = cleaned
+    return state
+
+
+# ------------------------------------------------------------
+# Watchlist metric computation + alert evaluation
+# ------------------------------------------------------------
+_WATCHLIST_METRIC_TTL_SECONDS = 300
+_WATCHLIST_METRIC_CACHE: Dict[str, tuple] = {}  # ticker -> (epoch, row_dict)
+_WATCHLIST_METRIC_LOCK = threading.Lock()
+
+
+def _format_market_cap(value) -> str:
+    try:
+        amount = float(value)
+    except (TypeError, ValueError):
+        return ""
+    if amount <= 0 or not np.isfinite(amount):
+        return ""
+    return _format_money_compact(amount)
+
+
+def _compute_static_ticker_row(ticker: str) -> Dict[str, object]:
+    """Compute price/MA/52w/market-cap metrics for a single ticker.
+
+    Returns a dict that's safe to merge into a watchlist row. Missing values are
+    omitted from the dict so DataTable can show blanks for unknown cells.
+    """
+    row: Dict[str, object] = {"ticker": ticker}
+    df = None
+    try:
+        df = get_price_df(ticker, "max")
+    except Exception as e:
+        print(f"[{ticker}] watchlist price load failed: {e}")
+        df = None
+
+    series = _extract_price_series(df) if df is not None else None
+    if series is not None and len(series):
+        last = float(series.iloc[-1])
+        row["price"] = round(last, 2)
+        if len(series) >= 2:
+            prev = float(series.iloc[-2])
+            if prev > 0:
+                row["change_pct"] = round(((last / prev) - 1.0) * 100.0, 2)
+        # 52-week position
+        try:
+            cutoff = series.index[-1] - pd.Timedelta(days=365)
+            window_52w = series[series.index >= cutoff]
+            if len(window_52w) > 1:
+                hi = float(window_52w.max())
+                lo = float(window_52w.min())
+                if hi > lo:
+                    row["pos_52w"] = round(((last - lo) / (hi - lo)) * 100.0, 1)
+        except Exception:
+            pass
+        # MA distances
+        if len(series) >= 250:
+            try:
+                ma_50w = float(series.rolling(250, min_periods=250).mean().iloc[-1])
+                if not pd.isna(ma_50w) and ma_50w > 0:
+                    row["dist_50w"] = round(((last / ma_50w) - 1.0) * 100.0, 2)
+            except Exception:
+                pass
+        if len(series) >= 1000:
+            try:
+                ma_200w = float(series.rolling(1000, min_periods=1000).mean().iloc[-1])
+                if not pd.isna(ma_200w) and ma_200w > 0:
+                    row["dist_200w"] = round(((last / ma_200w) - 1.0) * 100.0, 2)
+            except Exception:
+                pass
+        # Last updated
+        try:
+            row["last_price_at"] = pd.Timestamp(series.index[-1]).strftime("%Y-%m-%d")
+        except Exception:
+            pass
+
+    # Market cap + name from snapshot. yfinance can be slow; failures are OK.
+    try:
+        snap = get_company_snapshot(ticker)
+    except Exception as e:
+        print(f"[{ticker}] watchlist snapshot failed: {e}")
+        snap = None
+    if isinstance(snap, dict):
+        cap = snap.get("marketCap")
+        if cap:
+            try:
+                row["market_cap"] = float(cap)
+                row["market_cap_label"] = _format_market_cap(cap)
+            except (TypeError, ValueError):
+                pass
+        snap_name = (snap.get("longName") or snap.get("shortName") or "").strip()
+        if snap_name:
+            row["company_name"] = snap_name
+
+    # Stash the raw series for downstream alert evaluation.
+    row["_price_series"] = series
+    return row
+
+
+def _get_static_ticker_row(ticker: str) -> Dict[str, object]:
+    """Cached wrapper around _compute_static_ticker_row with a 5-minute TTL."""
+    sym = str(ticker or "").strip().upper()
+    if not sym:
+        return {}
+    now_ts = datetime.now().timestamp()
+    with _WATCHLIST_METRIC_LOCK:
+        cached = _WATCHLIST_METRIC_CACHE.get(sym)
+        if cached and now_ts - cached[0] < _WATCHLIST_METRIC_TTL_SECONDS:
+            return dict(cached[1])
+    row = _compute_static_ticker_row(sym)
+    with _WATCHLIST_METRIC_LOCK:
+        _WATCHLIST_METRIC_CACHE[sym] = (now_ts, dict(row))
+    return row
+
+
+def _evaluate_item_alerts(item: Dict[str, object], price_series: Optional[pd.Series]) -> List[str]:
+    triggered: List[str] = []
+    alerts = item.get("alerts") or []
+    if not alerts:
+        return triggered
+    if price_series is None or len(price_series) == 0:
+        return triggered
+
+    series = pd.to_numeric(price_series, errors="coerce").dropna()
+    if series.empty:
+        return triggered
+    last_close = float(series.iloc[-1])
+
+    for alert in alerts:
+        atype = alert.get("type")
+        try:
+            value = float(alert.get("value")) if alert.get("value") is not None else None
+        except (TypeError, ValueError):
+            value = None
+
+        if atype == "price_above" and value is not None and last_close >= value:
+            triggered.append(f"≥ ${value:,.2f}")
+        elif atype == "price_below" and value is not None and last_close <= value:
+            triggered.append(f"≤ ${value:,.2f}")
+        elif atype == "percent_move" and value is not None and len(series) >= 2:
+            first_close = float(series.iloc[0])
+            if first_close > 0:
+                pct = ((last_close / first_close) - 1.0) * 100.0
+                if abs(pct) >= abs(value):
+                    triggered.append(f"Move {pct:+.1f}%")
+        elif atype in {"crosses_50w_ma", "crosses_200w_ma"}:
+            window = 250 if atype == "crosses_50w_ma" else 1000
+            if len(series) > window:
+                ma = series.rolling(window, min_periods=window).mean()
+                if len(ma) >= 2:
+                    last_ma = ma.iloc[-1]
+                    prev_ma = ma.iloc[-2]
+                    if pd.notna(last_ma) and pd.notna(prev_ma):
+                        prev_close = float(series.iloc[-2])
+                        last_ma_f = float(last_ma)
+                        prev_ma_f = float(prev_ma)
+                        label = "50W MA" if atype == "crosses_50w_ma" else "200W MA"
+                        if prev_close < prev_ma_f and last_close >= last_ma_f:
+                            triggered.append(f"Crossed up {label}")
+                        elif prev_close > prev_ma_f and last_close <= last_ma_f:
+                            triggered.append(f"Crossed down {label}")
+    return triggered
+
+
+def _build_watchlist_table_rows(state) -> List[Dict[str, object]]:
+    """Combine watchlist items with cached price metrics for table display."""
+    state = _normalize_watchlist_state(state)
+    rows: List[Dict[str, object]] = []
+    for item in state["items"]:
+        ticker = item["ticker"]
+        static = _get_static_ticker_row(ticker)
+        series = static.pop("_price_series", None)
+
+        # Date added formatted short
+        date_added = item.get("date_added") or ""
+        try:
+            date_added = datetime.fromisoformat(date_added).strftime("%Y-%m-%d")
+        except Exception:
+            date_added = str(date_added)[:10]
+
+        triggered = _evaluate_item_alerts(item, series)
+        row = {
+            "ticker": ticker,
+            "company_name": static.get("company_name") or item.get("company_name") or "",
+            "price": static.get("price"),
+            "change_pct": static.get("change_pct"),
+            "market_cap": static.get("market_cap"),
+            "market_cap_label": static.get("market_cap_label", ""),
+            "pos_52w": static.get("pos_52w"),
+            "dist_50w": static.get("dist_50w"),
+            "dist_200w": static.get("dist_200w"),
+            "status": item.get("status") or WATCHLIST_DEFAULT_STATUS,
+            "tags": ", ".join(item.get("tags") or []),
+            "notes": (item.get("notes") or "")[:200],
+            "alerts": "; ".join(triggered),
+            "alert_count": len(triggered),
+            "date_added": date_added,
+            "last_price_at": static.get("last_price_at", ""),
+        }
+        rows.append(row)
+    return rows
+
+
+# ------------------------------------------------------------
+# Daily change summary renderer
+# ------------------------------------------------------------
+def _render_daily_change_summary(state, rows: Optional[List[Dict[str, object]]] = None) -> html.Div:
+    state = _normalize_watchlist_state(state)
+    items = state["items"]
+    if not items:
+        return html.Div(
+            [
+                html.Div("Daily Snapshot", style=SUMMARY_TILE_TITLE_STYLE),
+                html.Div(
+                    "Add tickers to see gainers, losers, and triggered alerts.",
+                    style={"fontSize": 13, "color": "#667085"},
+                ),
+            ],
+            style=SUMMARY_PANEL_STYLE,
+            className="watchlist-summary watchlist-summary--empty",
+        )
+
+    if rows is None:
+        rows = _build_watchlist_table_rows(state)
+
+    # Sort gainers / losers by daily change.
+    def change(row):
+        v = row.get("change_pct")
+        return float(v) if v is not None else None
+
+    with_change = [row for row in rows if change(row) is not None]
+    gainers = sorted(with_change, key=change, reverse=True)[:3]
+    losers = sorted(with_change, key=change)[:3]
+
+    # Triggered alerts.
+    triggered_rows = [row for row in rows if row.get("alert_count")]
+
+    # Near 200W MA: |dist_200w| <= 10
+    near_200w = [
+        row for row in rows
+        if row.get("dist_200w") is not None and abs(float(row["dist_200w"])) <= 10.0
+    ]
+
+    # Stale: no last_price_at OR price_at older than 7 days
+    stale: List[Dict[str, object]] = []
+    today = datetime.now().date()
+    for row in rows:
+        last = row.get("last_price_at")
+        if not last or row.get("price") is None:
+            stale.append(row)
+            continue
+        try:
+            last_date = datetime.strptime(str(last), "%Y-%m-%d").date()
+            if (today - last_date).days > 7:
+                stale.append(row)
+        except Exception:
+            stale.append(row)
+
+    def _gain_pill(row):
+        pct = change(row)
+        if pct is None:
+            return html.Span(row["ticker"], style=SUMMARY_TILE_PILL_STYLE)
+        return html.Span(
+            f"{row['ticker']} {pct:+.2f}%",
+            style=SUMMARY_PILL_GAIN_STYLE if pct >= 0 else SUMMARY_PILL_LOSS_STYLE,
+            title=row.get("company_name") or row["ticker"],
+        )
+
+    def _alert_pill(row):
+        return html.Span(
+            f"{row['ticker']} ({row['alert_count']})",
+            style=SUMMARY_PILL_ALERT_STYLE,
+            title=row.get("alerts") or "alert triggered",
+        )
+
+    def _plain_pill(row, *, label_suffix: str = ""):
+        text = row["ticker"] + (f" {label_suffix}" if label_suffix else "")
+        return html.Span(text, style=SUMMARY_TILE_PILL_STYLE, title=row.get("company_name") or row["ticker"])
+
+    def _tile(title: str, body, *, empty_msg: str):
+        return html.Div(
+            [
+                html.Div(title, style=SUMMARY_TILE_TITLE_STYLE),
+                body if body else html.Div(empty_msg, style={"fontSize": 12, "color": "#98a2b3"}),
+            ],
+            style=SUMMARY_TILE_STYLE,
+        )
+
+    gainers_tile = _tile(
+        "Biggest gainers",
+        html.Div([_gain_pill(r) for r in gainers], style=SUMMARY_TILE_LIST_STYLE) if gainers else None,
+        empty_msg="No daily change data yet.",
+    )
+    losers_tile = _tile(
+        "Biggest losers",
+        html.Div([_gain_pill(r) for r in losers], style=SUMMARY_TILE_LIST_STYLE) if losers else None,
+        empty_msg="No daily change data yet.",
+    )
+    alerts_tile = _tile(
+        "Triggered alerts",
+        html.Div([_alert_pill(r) for r in triggered_rows], style=SUMMARY_TILE_LIST_STYLE) if triggered_rows else None,
+        empty_msg="No alerts firing right now.",
+    )
+    near200_tile = _tile(
+        "Near 200W MA",
+        html.Div(
+            [_plain_pill(r, label_suffix=f"{float(r['dist_200w']):+.1f}%") for r in near_200w],
+            style=SUMMARY_TILE_LIST_STYLE,
+        ) if near_200w else None,
+        empty_msg="None within 10% of the 200-week MA.",
+    )
+    stale_tile = _tile(
+        "Stale data",
+        html.Div([_plain_pill(r) for r in stale], style=SUMMARY_TILE_LIST_STYLE) if stale else None,
+        empty_msg="All tickers refreshed in the last week.",
+    )
+
+    return html.Div(
+        [
+            html.Div(
+                [
+                    html.Div("Daily Snapshot", style=WATCHLIST_TRAY_TITLE_STYLE),
+                    html.Div(
+                        f"Across {len(items)} ticker{'s' if len(items) != 1 else ''}",
+                        style=WATCHLIST_TRAY_HINT_STYLE,
+                    ),
+                ],
+                style=WATCHLIST_TRAY_HEADER_STYLE,
+            ),
+            html.Div(
+                [gainers_tile, losers_tile, alerts_tile, near200_tile, stale_tile],
+                style=SUMMARY_GRID_STYLE,
+                className="watchlist-summary-grid",
+            ),
+        ],
+        style=SUMMARY_PANEL_STYLE,
+        className="watchlist-summary",
+    )
+
+
+# ------------------------------------------------------------
+# Per-ticker alerts editor renderer
+# ------------------------------------------------------------
+def _render_alerts_panel(state) -> html.Div:
+    state = _normalize_watchlist_state(state)
+    primary = state["primary"]
+    if not primary:
+        return html.Div(
+            "Set a primary ticker to manage its alerts.",
+            style={**ALERTS_PANEL_STYLE, "color": "#667085", "fontSize": 13},
+            className="alerts-panel alerts-panel--empty",
+        )
+
+    item = _watchlist_get_item(state, primary)
+    if item is None:
+        return html.Div(
+            "Primary ticker is not in the watch list.",
+            style={**ALERTS_PANEL_STYLE, "color": "#667085", "fontSize": 13},
+            className="alerts-panel alerts-panel--empty",
+        )
+
+    static = _get_static_ticker_row(primary)
+    triggered = _evaluate_item_alerts(item, static.get("_price_series"))
+    triggered_set = set(triggered)
+    alerts = item.get("alerts") or []
+
+    # Existing alerts list
+    list_children = []
+    if not alerts:
+        list_children.append(
+            html.Div(
+                "No alerts configured for this ticker yet.",
+                style={"fontSize": 12, "color": "#667085"},
+            )
+        )
+    else:
+        for index, alert in enumerate(alerts):
+            atype = alert.get("type")
+            label = WATCHLIST_ALERT_LABELS.get(atype, atype)
+            value = alert.get("value")
+            if atype in {"price_above", "price_below"} and value is not None:
+                value_str = f"${float(value):,.2f}"
+            elif atype == "percent_move" and value is not None:
+                value_str = f"{float(value):.1f}%"
+            else:
+                value_str = ""
+            note = alert.get("note") or ""
+            triggered_now = any(t.startswith(("≥", "≤", "Move", "Crossed")) for t in triggered) and (
+                # Best-effort matching by type label
+                (atype == "price_above" and any(t.startswith("≥") for t in triggered_set))
+                or (atype == "price_below" and any(t.startswith("≤") for t in triggered_set))
+                or (atype == "percent_move" and any(t.startswith("Move") for t in triggered_set))
+                or (atype == "crosses_50w_ma" and any("50W" in t for t in triggered_set))
+                or (atype == "crosses_200w_ma" and any("200W" in t for t in triggered_set))
+            )
+            row_children = [
+                html.Span(
+                    [
+                        html.Span(label, style={"fontWeight": 600}),
+                        " ",
+                        html.Span(value_str, style={"color": "#101828"}),
+                        (
+                            html.Span(f" — {note}", style={"color": "#667085"})
+                            if note
+                            else None
+                        ),
+                        (_alerts_triggered_badge() if triggered_now else None),
+                    ],
+                    style={"display": "flex", "alignItems": "center", "gap": 4, "flexWrap": "wrap"},
+                ),
+                html.Button(
+                    "Remove",
+                    id={"type": "wl-alert-remove", "index": index},
+                    n_clicks=0,
+                    style={**WATCHLIST_CHIP_BUTTON_STYLE, "color": "#b42318", "fontSize": 12},
+                ),
+            ]
+            list_children.append(html.Div(row_children, style=ALERTS_ROW_STYLE))
+
+    add_form = html.Div(
+        [
+            dcc.Dropdown(
+                id="wl-alert-type",
+                options=[{"label": WATCHLIST_ALERT_LABELS[t], "value": t} for t in WATCHLIST_ALERT_TYPES],
+                value="price_above",
+                clearable=False,
+                style={"fontSize": 12},
+            ),
+            dcc.Input(
+                id="wl-alert-value",
+                type="number",
+                placeholder="Threshold",
+                value=None,
+                style=ALERTS_INPUT_STYLE,
+            ),
+            dcc.Input(
+                id="wl-alert-note",
+                type="text",
+                placeholder="Optional note",
+                value="",
+                style=ALERTS_INPUT_STYLE,
+            ),
+            html.Button(
+                "Add alert",
+                id="wl-alert-add",
+                n_clicks=0,
+                style=ALERTS_BUTTON_STYLE,
+            ),
+        ],
+        style=ALERTS_FORM_STYLE,
+        className="alerts-form",
+    )
+
+    triggered_summary = (
+        html.Div(
+            [
+                html.Span("Currently triggered: ", style={"fontWeight": 600, "color": "#92400e"}),
+                html.Span("; ".join(triggered)),
+            ],
+            style={"fontSize": 12, "color": "#92400e"},
+        )
+        if triggered
+        else None
+    )
+
+    return html.Div(
+        [
+            html.Div(
+                [
+                    html.Div(
+                        [
+                            html.Span("Alerts for ", style={"color": "#667085", "fontSize": 12}),
+                            html.Span(primary, style={"fontWeight": 700, "fontSize": 14, "color": "#101828"}),
+                            _status_badge(item.get("status")),
+                        ],
+                        style={"display": "flex", "alignItems": "center", "gap": 6, "flexWrap": "wrap"},
+                    ),
+                    html.Div(
+                        f"{len(alerts)} alert{'s' if len(alerts) != 1 else ''} configured",
+                        style={"fontSize": 12, "color": "#667085"},
+                    ),
+                ],
+                style=WATCHLIST_TRAY_HEADER_STYLE,
+            ),
+            triggered_summary,
+            html.Div(list_children, style=ALERTS_LIST_STYLE),
+            html.Div("Add a new alert", style={"fontSize": 12, "color": "#667085", "marginTop": 4}),
+            add_form,
+        ],
+        style=ALERTS_PANEL_STYLE,
+        className="alerts-panel",
+    )
+
+
+def _alerts_triggered_badge():
+    return html.Span("Triggered", style=ALERTS_TRIGGERED_BADGE_STYLE)
 
 
 def _transform_chart_series(
@@ -1219,6 +2078,274 @@ def _render_async_ticker_panel(
     )
 
 # ------------------------------------------------------------
+# Watchlist tray + table styles, and tray renderer
+# ------------------------------------------------------------
+WATCHLIST_TRAY_CARD_STYLE = {
+    "display": "grid",
+    "gap": 10,
+    "padding": "12px 14px",
+    "border": "1px solid #e6e6e6",
+    "borderRadius": 12,
+    "background": "#ffffff",
+    "boxShadow": "0 1px 2px rgba(0,0,0,.03)",
+}
+WATCHLIST_TRAY_HEADER_STYLE = {
+    "display": "flex",
+    "alignItems": "center",
+    "justifyContent": "space-between",
+    "gap": 8,
+    "flexWrap": "wrap",
+}
+WATCHLIST_TRAY_TITLE_STYLE = {"fontWeight": 700, "fontSize": 13, "color": "#101828"}
+WATCHLIST_TRAY_HINT_STYLE = {"fontSize": 12, "color": "#667085"}
+WATCHLIST_CHIPS_STYLE = {
+    "display": "flex",
+    "flexWrap": "wrap",
+    "gap": 8,
+    "alignItems": "center",
+}
+WATCHLIST_CHIP_STYLE = {
+    "display": "inline-flex",
+    "alignItems": "center",
+    "gap": 6,
+    "padding": "4px 8px 4px 10px",
+    "border": "1px solid #d0d5dd",
+    "borderRadius": 999,
+    "background": "#ffffff",
+    "fontSize": 13,
+    "color": "#101828",
+    "maxWidth": "100%",
+}
+WATCHLIST_CHIP_PRIMARY_STYLE = {
+    **WATCHLIST_CHIP_STYLE,
+    "background": "#101828",
+    "color": "#ffffff",
+    "border": "1px solid #101828",
+    "boxShadow": "0 1px 2px rgba(16,24,40,.18)",
+}
+WATCHLIST_CHIP_BUTTON_STYLE = {
+    "background": "transparent",
+    "border": "none",
+    "cursor": "pointer",
+    "padding": "0 4px",
+    "color": "inherit",
+    "lineHeight": 1,
+    "fontWeight": 600,
+}
+WATCHLIST_CLEAR_BUTTON_STYLE = {
+    "background": "#ffffff",
+    "border": "1px solid #d0d5dd",
+    "borderRadius": 8,
+    "padding": "6px 10px",
+    "fontSize": 12,
+    "color": "#344054",
+    "cursor": "pointer",
+    "marginLeft": "auto",
+}
+WATCHLIST_QUICK_ADD_ROW_STYLE = {
+    "display": "flex",
+    "gap": 6,
+    "alignItems": "center",
+    "flexWrap": "wrap",
+}
+WATCHLIST_QUICK_ADD_INPUT_STYLE = {
+    "flex": "1 1 160px",
+    "minWidth": 0,
+    "border": "1px solid #d0d5dd",
+    "borderRadius": 8,
+    "padding": "6px 10px",
+    "fontSize": 13,
+    "color": "#101828",
+    "background": "#ffffff",
+    "outline": "none",
+    "height": 32,
+    "boxSizing": "border-box",
+}
+WATCHLIST_QUICK_ADD_BUTTON_STYLE = {
+    "background": "#101828",
+    "color": "#ffffff",
+    "border": "1px solid #101828",
+    "borderRadius": 8,
+    "padding": "6px 12px",
+    "fontSize": 12,
+    "fontWeight": 700,
+    "cursor": "pointer",
+    "height": 32,
+}
+
+
+def _status_badge(status: str, *, on_dark: bool = False) -> html.Span:
+    key = status if status in WATCHLIST_STATUSES else WATCHLIST_DEFAULT_STATUS
+    color = WATCHLIST_STATUS_COLORS[key]
+    style = {
+        "display": "inline-flex",
+        "alignItems": "center",
+        "padding": "1px 6px",
+        "borderRadius": 999,
+        "fontSize": 10,
+        "fontWeight": 700,
+        "letterSpacing": "0.04em",
+        "textTransform": "uppercase",
+        "background": color["bg"],
+        "color": color["fg"],
+        "border": f"1px solid {color['border']}",
+    }
+    if on_dark:
+        style["background"] = "rgba(255,255,255,0.18)"
+        style["color"] = "#ffffff"
+        style["border"] = "1px solid rgba(255,255,255,0.4)"
+    return html.Span(WATCHLIST_STATUS_LABELS[key], style=style, title=f"Status: {WATCHLIST_STATUS_LABELS[key]}")
+
+
+def _render_watchlist_tray(state) -> html.Div:
+    watchlist = _normalize_watchlist_state(state)
+    items = watchlist["items"]
+    primary = watchlist["primary"]
+
+    quick_add_row = html.Div(
+        [
+            dcc.Input(
+                id="watchlist-quick-add",
+                type="text",
+                placeholder="Quick add a ticker (e.g. NVDA)",
+                debounce=False,
+                n_submit=0,
+                value="",
+                style=WATCHLIST_QUICK_ADD_INPUT_STYLE,
+                className="watchlist-quick-add-input",
+            ),
+            html.Button(
+                "Add to watch list",
+                id="watchlist-quick-add-btn",
+                n_clicks=0,
+                style=WATCHLIST_QUICK_ADD_BUTTON_STYLE,
+                className="watchlist-quick-add-btn",
+            ),
+            html.Div(
+                id="watchlist-quick-add-feedback",
+                style={"fontSize": 12, "color": "#667085", "minHeight": 16},
+            ),
+        ],
+        style=WATCHLIST_QUICK_ADD_ROW_STYLE,
+        className="watchlist-quick-add-row",
+    )
+
+    if not items:
+        return html.Div(
+            [
+                html.Div(
+                    [
+                        html.Div("Watch List", style=WATCHLIST_TRAY_TITLE_STYLE),
+                        html.Div(
+                            "Empty. Add tickers from the search above or any discovery panel.",
+                            style=WATCHLIST_TRAY_HINT_STYLE,
+                        ),
+                    ],
+                    style=WATCHLIST_TRAY_HEADER_STYLE,
+                ),
+                quick_add_row,
+            ],
+            style={**WATCHLIST_TRAY_CARD_STYLE, "borderStyle": "dashed"},
+            className="watchlist-tray watchlist-tray--empty",
+        )
+
+    chips = []
+    for item in items:
+        symbol = item["ticker"]
+        is_primary = symbol == primary
+        chip_style = WATCHLIST_CHIP_PRIMARY_STYLE if is_primary else WATCHLIST_CHIP_STYLE
+        company = (item.get("company_name") or "").strip()
+        chip_children = [html.Span(symbol, style={"fontWeight": 700})]
+        if company:
+            short_company = company if len(company) <= 24 else company[:22] + "…"
+            chip_children.append(
+                html.Span(
+                    short_company,
+                    style={
+                        "fontSize": 11,
+                        "opacity": 0.75,
+                        "marginLeft": 2,
+                        "maxWidth": 160,
+                        "overflow": "hidden",
+                        "textOverflow": "ellipsis",
+                        "whiteSpace": "nowrap",
+                    },
+                    title=company,
+                )
+            )
+        chip_children.append(_status_badge(item.get("status"), on_dark=is_primary))
+
+        if is_primary:
+            chip_children.append(
+                html.Span(
+                    "Primary",
+                    style={
+                        "fontSize": 10,
+                        "letterSpacing": "0.06em",
+                        "textTransform": "uppercase",
+                        "opacity": 0.85,
+                    },
+                )
+            )
+        else:
+            chip_children.append(
+                html.Button(
+                    "Set primary",
+                    id={"type": "wl-primary", "index": symbol},
+                    n_clicks=0,
+                    title=f"Make {symbol} the primary ticker",
+                    style={**WATCHLIST_CHIP_BUTTON_STYLE, "fontSize": 11},
+                )
+            )
+        chip_children.append(
+            html.Button(
+                "x",
+                id={"type": "wl-remove", "index": symbol},
+                n_clicks=0,
+                title=f"Remove {symbol} from watch list",
+                style={**WATCHLIST_CHIP_BUTTON_STYLE, "fontSize": 14, "fontWeight": 700},
+            )
+        )
+        chip_class = "watchlist-chip"
+        if is_primary:
+            chip_class += " watchlist-chip--primary"
+        chips.append(html.Div(chip_children, style=chip_style, className=chip_class))
+
+    summary = f"{len(items)} ticker{'s' if len(items) != 1 else ''}"
+    if primary:
+        summary += f" • primary: {primary}"
+
+    return html.Div(
+        [
+            html.Div(
+                [
+                    html.Div("Watch List", style=WATCHLIST_TRAY_TITLE_STYLE),
+                    html.Div(summary, style=WATCHLIST_TRAY_HINT_STYLE),
+                ],
+                style=WATCHLIST_TRAY_HEADER_STYLE,
+            ),
+            html.Div(
+                [
+                    *chips,
+                    html.Button(
+                        "Clear all",
+                        id="wl-clear-all",
+                        n_clicks=0,
+                        style=WATCHLIST_CLEAR_BUTTON_STYLE,
+                        title="Remove every ticker from the watch list",
+                    ),
+                ],
+                style=WATCHLIST_CHIPS_STYLE,
+                className="watchlist-chips",
+            ),
+            quick_add_row,
+        ],
+        style=WATCHLIST_TRAY_CARD_STYLE,
+        className="watchlist-tray",
+    )
+
+
+# ------------------------------------------------------------
 # Layout
 # ------------------------------------------------------------
 PAGE_CONTAINER_STYLE = {
@@ -1361,6 +2488,189 @@ GATE_STATUS_BOX_STYLE = {
     "border": "1px solid #e4e7ec",
 }
 GATE_HELP_TEXT_STYLE = {"fontSize": 13, "color": "#667085", "lineHeight": 1.6}
+SECTION_HEADER_STYLE = {
+    "display": "flex",
+    "alignItems": "baseline",
+    "justifyContent": "space-between",
+    "gap": 8,
+    "flexWrap": "wrap",
+    "marginTop": 4,
+    "padding": "0 4px",
+}
+SECTION_TITLE_STYLE = {
+    "margin": 0,
+    "fontSize": 14,
+    "fontWeight": 700,
+    "color": "#101828",
+    "letterSpacing": "0.04em",
+    "textTransform": "uppercase",
+}
+SECTION_HINT_STYLE = {"fontSize": 12, "color": "#667085"}
+PRIMARY_LABEL_STYLE = {
+    "display": "inline-flex",
+    "alignItems": "center",
+    "gap": 6,
+    "padding": "2px 8px",
+    "borderRadius": 999,
+    "background": "#eef4ff",
+    "color": "#1849a9",
+    "fontSize": 11,
+    "fontWeight": 700,
+    "letterSpacing": "0.06em",
+    "textTransform": "uppercase",
+}
+FAVORITE_BUTTON_FILLED_STYLE = {
+    "display": "inline-flex",
+    "alignItems": "center",
+    "gap": 4,
+    "padding": "4px 10px",
+    "borderRadius": 999,
+    "background": "#fef3c7",
+    "color": "#92400e",
+    "border": "1px solid #fde68a",
+    "fontSize": 12,
+    "fontWeight": 700,
+    "cursor": "pointer",
+    "lineHeight": 1.2,
+}
+FAVORITE_BUTTON_EMPTY_STYLE = {
+    "display": "inline-flex",
+    "alignItems": "center",
+    "gap": 4,
+    "padding": "4px 10px",
+    "borderRadius": 999,
+    "background": "#ffffff",
+    "color": "#344054",
+    "border": "1px solid #d0d5dd",
+    "fontSize": 12,
+    "fontWeight": 700,
+    "cursor": "pointer",
+    "lineHeight": 1.2,
+}
+DISCOVERY_TABS_STYLE = {"display": "grid", "gap": 12}
+SUMMARY_PANEL_STYLE = {
+    "display": "grid",
+    "gap": 10,
+    "padding": "12px 14px",
+    "border": "1px solid #e6e6e6",
+    "borderRadius": 12,
+    "background": "#ffffff",
+    "boxShadow": "0 1px 2px rgba(0,0,0,.03)",
+}
+SUMMARY_GRID_STYLE = {
+    "display": "grid",
+    "gridTemplateColumns": "repeat(auto-fit, minmax(180px, 1fr))",
+    "gap": 12,
+}
+SUMMARY_TILE_STYLE = {
+    "display": "grid",
+    "gap": 6,
+    "padding": "10px 12px",
+    "border": "1px solid #e4e7ec",
+    "borderRadius": 10,
+    "background": "#fafbfc",
+    "minWidth": 0,
+}
+SUMMARY_TILE_TITLE_STYLE = {
+    "fontSize": 11,
+    "letterSpacing": "0.04em",
+    "textTransform": "uppercase",
+    "color": "#667085",
+    "fontWeight": 700,
+}
+SUMMARY_TILE_VALUE_STYLE = {"fontSize": 14, "fontWeight": 700, "color": "#101828"}
+SUMMARY_TILE_LIST_STYLE = {"display": "flex", "flexWrap": "wrap", "gap": 6}
+SUMMARY_TILE_PILL_STYLE = {
+    "display": "inline-flex",
+    "alignItems": "center",
+    "padding": "2px 8px",
+    "borderRadius": 999,
+    "border": "1px solid #d0d5dd",
+    "background": "#ffffff",
+    "fontSize": 12,
+    "color": "#101828",
+}
+SUMMARY_PILL_GAIN_STYLE = {**SUMMARY_TILE_PILL_STYLE, "borderColor": "#abefc6", "color": "#1a7f37", "background": "#ecfdf3"}
+SUMMARY_PILL_LOSS_STYLE = {**SUMMARY_TILE_PILL_STYLE, "borderColor": "#fecdca", "color": "#b42318", "background": "#fef3f2"}
+SUMMARY_PILL_ALERT_STYLE = {**SUMMARY_TILE_PILL_STYLE, "borderColor": "#fde68a", "color": "#92400e", "background": "#fef3c7"}
+WATCHLIST_TABLE_HEADER_STYLE = {
+    "display": "flex",
+    "alignItems": "baseline",
+    "justifyContent": "space-between",
+    "flexWrap": "wrap",
+    "gap": 8,
+    "marginBottom": 8,
+}
+WATCHLIST_TABLE_TOOLBAR_STYLE = {
+    "display": "flex",
+    "alignItems": "center",
+    "gap": 12,
+    "flexWrap": "wrap",
+    "marginBottom": 10,
+}
+WATCHLIST_TABLE_STATUS_FILTER_STYLE = {"minWidth": 200, "flex": "1 1 220px"}
+ALERTS_PANEL_STYLE = {
+    "display": "grid",
+    "gap": 10,
+    "padding": "12px 14px",
+    "border": "1px solid #e4e7ec",
+    "borderRadius": 12,
+    "background": "#fafbfc",
+}
+ALERTS_FORM_STYLE = {
+    "display": "grid",
+    "gridTemplateColumns": "minmax(160px, 1fr) minmax(120px, 1fr) minmax(160px, 2fr) auto",
+    "gap": 8,
+    "alignItems": "end",
+}
+ALERTS_INPUT_STYLE = {
+    "border": "1px solid #d0d5dd",
+    "borderRadius": 8,
+    "padding": "6px 10px",
+    "fontSize": 13,
+    "color": "#101828",
+    "background": "#ffffff",
+    "outline": "none",
+    "height": 32,
+    "boxSizing": "border-box",
+}
+ALERTS_BUTTON_STYLE = {
+    "background": "#101828",
+    "color": "#ffffff",
+    "border": "1px solid #101828",
+    "borderRadius": 8,
+    "padding": "6px 12px",
+    "fontSize": 12,
+    "fontWeight": 700,
+    "cursor": "pointer",
+    "height": 32,
+}
+ALERTS_LIST_STYLE = {"display": "grid", "gap": 6}
+ALERTS_ROW_STYLE = {
+    "display": "flex",
+    "alignItems": "center",
+    "justifyContent": "space-between",
+    "gap": 8,
+    "padding": "6px 10px",
+    "border": "1px solid #e4e7ec",
+    "borderRadius": 8,
+    "background": "#ffffff",
+    "fontSize": 12,
+}
+ALERTS_TRIGGERED_BADGE_STYLE = {
+    "display": "inline-flex",
+    "alignItems": "center",
+    "padding": "1px 6px",
+    "borderRadius": 999,
+    "background": "#fef3c7",
+    "color": "#92400e",
+    "border": "1px solid #fde68a",
+    "fontSize": 10,
+    "fontWeight": 700,
+    "letterSpacing": "0.04em",
+    "textTransform": "uppercase",
+    "marginLeft": 6,
+}
 CLUSTERS_GRAPH_STYLE = {"width": "100%", "height": "70vh", "minHeight": 420}
 CLUSTERS_NOTE_STYLE = {
     "fontSize": 13,
@@ -1777,225 +3087,553 @@ _LEGACY_LAYOUT = html.Div(
     ], style={"maxWidth": 1200, "margin": "0 auto", "padding": 14})
 """
 
+def _initial_watchlist_state() -> Dict[str, object]:
+    """Default watchlist when no local-storage payload is present."""
+    initial = _watchlist_add(_empty_watchlist_state(), "AAPL", set_primary=True)
+    return initial
+
+
 def build_stock_explorer_page(pathname: Optional[str]):
+    initial_watchlist = _initial_watchlist_state()
     return html.Div(
         [
             _build_page_header(
                 APP_TITLE,
-                "Explore unfamiliar tickers with price history and quick context.",
+                "Track tickers, record research, and compare candidates.",
                 pathname,
             ),
-        html.Div(
-            [
-                html.Div(
-                    [
-                        html.Div("Search", style=CONTROL_LABEL_STYLE),
-                        html.Div("Select one or more tickers or company names.", style=CONTROL_HINT_STYLE),
-                        dcc.Dropdown(
-                            id="ticker",
-                            options=tickers,
-                            value=["AAPL"],
-                            multi=True,
-                            placeholder="Start typing a ticker or company name...",
-                            maxHeight=420,
-                            style=DROPDOWN_STYLE,
-                        ),
-                    ],
-                    style=SEARCH_BLOCK_STYLE,
-                ),
-                html.Div(
-                    [
-                        html.Div(
-                            [
-                                html.Div(
-                                    [
-                                        html.Div("Timeframe", style=CONTROL_LABEL_STYLE),
-                                        dcc.RadioItems(
-                                            id="timeframe",
-                                            options=[{"label": lab, "value": val} for lab, val in TIMEFRAMES],
-                                            value="6mo",
-                                            style=RADIO_ITEMS_STYLE,
-                                            labelStyle=RADIO_LABEL_STYLE,
-                                        ),
-                                    ],
-                                    style=CONTROL_BLOCK_STYLE,
-                                ),
-                                html.Div(
-                                    [
-                                        html.Div("Moving averages", style=CONTROL_LABEL_STYLE),
-                                        dcc.Checklist(
-                                            id="ma-checklist",
-                                            options=[{"label": lab, "value": val} for lab, val, _ in MA_OPTIONS],
-                                            value=[],
-                                            style=CHECKLIST_STYLE,
-                                            labelStyle=CHECKLIST_LABEL_STYLE,
-                                        ),
-                                    ],
-                                    id="ma-control-block",
-                                    style=WIDE_CONTROL_BLOCK_STYLE,
-                                ),
-                                html.Div(
-                                    [
-                                        html.Div("Chart mode", style=CONTROL_LABEL_STYLE),
-                                        dcc.Checklist(
-                                            id="chart-mode-toggle",
-                                            options=[
-                                                {"label": label, "value": value}
-                                                for label, value in CHART_MODE_OPTIONS
-                                            ],
-                                            value=[],
-                                            style=CHECKLIST_STYLE,
-                                            labelStyle=CHECKLIST_LABEL_STYLE,
-                                        ),
-                                    ],
-                                    style=CONTROL_BLOCK_STYLE,
-                                ),
-                            ],
-                            style=TOP_CONTROL_ROW_STYLE,
-                        ),
-                    ],
-                    style=SEARCH_BLOCK_STYLE,
-                ),
-            ],
-            style=CONTROL_STACK_STYLE,
-        ),
-        html.Div(
-            [
-                html.Div(
-                    [
-                        html.Div(
-                            [
-                                html.Div(
-                                    id="price-summary",
-                                    children=_build_price_summary_cards({}),
-                                    style=PRICE_SUMMARY_ROW_STYLE,
-                                ),
-                                dcc.Loading(
-                                    dcc.Graph(
-                                        id="price-chart",
-                                        figure=make_price_figure(None, "--", "--"),
-                                        config={"displaylogo": False, "responsive": True},
-                                        style={"width": "100%"},
+            dcc.Store(
+                id="watchlist-store",
+                storage_type="local",
+                data=initial_watchlist,
+            ),
+            dcc.Store(id="wl-table-rows", data=[]),
+            dcc.Interval(id="wl-refresh", interval=300_000, n_intervals=0),
+            html.Div(
+                [
+                    html.Div(
+                        [
+                            html.Div("Search", style=CONTROL_LABEL_STYLE),
+                            html.Div(
+                                "Select one or more tickers or company names.",
+                                style=CONTROL_HINT_STYLE,
+                            ),
+                            dcc.Dropdown(
+                                id="ticker",
+                                options=tickers,
+                                value=["AAPL"],
+                                multi=True,
+                                placeholder="Start typing a ticker or company name...",
+                                maxHeight=420,
+                                style=DROPDOWN_STYLE,
+                            ),
+                        ],
+                        style=SEARCH_BLOCK_STYLE,
+                        className="search-block",
+                    ),
+                    html.Div(
+                        [
+                            html.Div(
+                                [
+                                    html.Div(
+                                        [
+                                            html.Div("Timeframe", style=CONTROL_LABEL_STYLE),
+                                            dcc.RadioItems(
+                                                id="timeframe",
+                                                options=[{"label": lab, "value": val} for lab, val in TIMEFRAMES],
+                                                value="6mo",
+                                                style=RADIO_ITEMS_STYLE,
+                                                labelStyle=RADIO_LABEL_STYLE,
+                                            ),
+                                        ],
+                                        style=CONTROL_BLOCK_STYLE,
                                     ),
-                                    type="default",
-                                ),
-                            ],
-                            style=CARD_STYLE,
-                        ),
-                        html.Div(
-                            [
-                                html.H3("Company Snapshot", style={"marginTop": 0}),
-                                html.Div(id="company-name", style={"fontWeight": 600}),
-                                html.Div(id="company-meta", style={"color": "#666", "marginBottom": 6}),
-                                html.Div(id="company-cap", style={"marginBottom": 10}),
-                                html.Div("About:", style={"fontWeight": 600, "marginTop": 6}),
-                                html.Div(id="company-about", style={"whiteSpace": "pre-wrap"}),
-                            ],
-                            style=CARD_STYLE,
-                        ),
-                        html.Div(
-                            [
-                                html.H3("Company Financials", style={"marginTop": 0, "marginBottom": 10}),
-                                html.Div(
-                                    [
-                                        html.Div("Revenue from SEC filings with a Yahoo Finance fallback.", style=CONTROL_HINT_STYLE),
-                                        dcc.RadioItems(
-                                            id="financial-period",
-                                            options=[{"label": label, "value": value} for label, value in FINANCIAL_PERIOD_OPTIONS],
-                                            value="quarterly",
-                                            style=RADIO_ITEMS_STYLE,
-                                            labelStyle=RADIO_LABEL_STYLE,
-                                        ),
-                                        html.Div(id="financials-caption", style=CONTROL_HINT_STYLE),
-                                    ],
-                                    style={"display": "grid", "gap": 8, "marginBottom": 10},
-                                ),
-                                dcc.Loading(
-                                    dcc.Graph(
-                                        id="financials-chart",
-                                        figure=make_financials_figure(None, "--", "Quarterly"),
-                                        config={"displaylogo": False, "responsive": True},
-                                        style={"width": "100%"},
+                                    html.Div(
+                                        [
+                                            html.Div("Moving averages", style=CONTROL_LABEL_STYLE),
+                                            dcc.Checklist(
+                                                id="ma-checklist",
+                                                options=[{"label": lab, "value": val} for lab, val, _ in MA_OPTIONS],
+                                                value=[],
+                                                style=CHECKLIST_STYLE,
+                                                labelStyle=CHECKLIST_LABEL_STYLE,
+                                            ),
+                                        ],
+                                        id="ma-control-block",
+                                        style=WIDE_CONTROL_BLOCK_STYLE,
                                     ),
-                                    type="default",
-                                ),
+                                    html.Div(
+                                        [
+                                            html.Div("Chart mode", style=CONTROL_LABEL_STYLE),
+                                            dcc.Checklist(
+                                                id="chart-mode-toggle",
+                                                options=[
+                                                    {"label": label, "value": value}
+                                                    for label, value in CHART_MODE_OPTIONS
+                                                ],
+                                                value=[],
+                                                style=CHECKLIST_STYLE,
+                                                labelStyle=CHECKLIST_LABEL_STYLE,
+                                            ),
+                                        ],
+                                        style=CONTROL_BLOCK_STYLE,
+                                    ),
+                                ],
+                                style=TOP_CONTROL_ROW_STYLE,
+                                className="control-row",
+                            ),
+                        ],
+                        style=SEARCH_BLOCK_STYLE,
+                    ),
+                ],
+                style=CONTROL_STACK_STYLE,
+                className="controls-stack",
+            ),
+            html.Div(
+                id="watchlist-tray",
+                children=_render_watchlist_tray(initial_watchlist),
+                className="watchlist-tray-host",
+            ),
+            dcc.ConfirmDialog(
+                id="wl-clear-confirm",
+                message="Remove every ticker from your watch list? Notes, tags, and alerts will be deleted.",
+            ),
+            # ── Daily change summary (Phase 10) ─────────────────────────
+            html.Div(
+                id="watchlist-summary",
+                children=_render_daily_change_summary(initial_watchlist),
+                className="watchlist-summary-host",
+            ),
+            html.Div(
+                [
+                    html.Div(
+                        [
+                            html.Div(id="price-chart-title", style={"fontWeight": 700, "fontSize": 14, "color": "#101828"}),
+                            dcc.Checklist(
+                                id="wl-compare-toggle",
+                                options=[{"label": " Compare selected only", "value": "compare"}],
+                                value=[],
+                                style={"display": "flex", "alignItems": "center", "fontSize": 12, "color": "#344054"},
+                                labelStyle={"display": "flex", "alignItems": "center", "gap": 4},
+                                inputStyle={"margin": "0 4px 0 0"},
+                            ),
+                        ],
+                        style={
+                            "display": "flex",
+                            "alignItems": "center",
+                            "justifyContent": "space-between",
+                            "gap": 8,
+                            "flexWrap": "wrap",
+                            "marginBottom": 8,
+                        },
+                    ),
+                    html.Div(
+                        id="price-summary",
+                        children=_build_price_summary_cards({}),
+                        style=PRICE_SUMMARY_ROW_STYLE,
+                        className="price-summary",
+                    ),
+                    dcc.Loading(
+                        dcc.Graph(
+                            id="price-chart",
+                            figure=make_price_figure(None, "--", "--"),
+                            config={"displaylogo": False, "responsive": True},
+                            style={"width": "100%"},
+                        ),
+                        type="default",
+                    ),
+                ],
+                style=CARD_STYLE,
+                className="card price-chart-card",
+            ),
+            # ── Watch List section (Phases 5-7, 9) ──────────────────────
+            html.Div(
+                [
+                    html.H2("Watch List", style=SECTION_TITLE_STYLE),
+                    html.Div(
+                        "Edit notes, tags, status, and alerts inline. Sort or filter to scan ideas.",
+                        style=SECTION_HINT_STYLE,
+                    ),
+                ],
+                style=SECTION_HEADER_STYLE,
+                className="section-header",
+            ),
+            html.Div(
+                [
+                    html.Div(
+                        [
+                            html.Div("Filter by status", style=CONTROL_LABEL_STYLE),
+                            dcc.Dropdown(
+                                id="wl-status-filter",
+                                options=[
+                                    {"label": "All statuses", "value": "__all__"},
+                                    *[
+                                        {"label": WATCHLIST_STATUS_LABELS[s], "value": s}
+                                        for s in WATCHLIST_STATUSES
+                                    ],
+                                ],
+                                value="__all__",
+                                clearable=False,
+                                multi=False,
+                                style=WATCHLIST_TABLE_STATUS_FILTER_STYLE,
+                            ),
+                        ],
+                        style={"display": "grid", "gap": 4, "flex": "1 1 220px"},
+                    ),
+                    html.Div(
+                        [
+                            html.Div("Filter by tag", style=CONTROL_LABEL_STYLE),
+                            dcc.Input(
+                                id="wl-tag-filter",
+                                type="text",
+                                placeholder="Comma-separated tags (e.g. semis, ai)",
+                                value="",
+                                debounce=True,
+                                style=WATCHLIST_QUICK_ADD_INPUT_STYLE,
+                            ),
+                        ],
+                        style={"display": "grid", "gap": 4, "flex": "2 1 240px"},
+                    ),
+                    html.Div(
+                        id="wl-table-count",
+                        style={"fontSize": 12, "color": "#667085", "marginLeft": "auto"},
+                    ),
+                ],
+                style=WATCHLIST_TABLE_TOOLBAR_STYLE,
+                className="watchlist-table-toolbar",
+            ),
+            html.Div(
+                [
+                    dash_table.DataTable(
+                        id="watchlist-table",
+                        columns=[
+                            {"name": "Ticker", "id": "ticker", "editable": False},
+                            {"name": "Company", "id": "company_name", "editable": False},
+                            {
+                                "name": "Price",
+                                "id": "price",
+                                "type": "numeric",
+                                "format": {"specifier": "$,.2f"},
+                                "editable": False,
+                            },
+                            {
+                                "name": "Day %",
+                                "id": "change_pct",
+                                "type": "numeric",
+                                "format": {"specifier": "+.2f"},
+                                "editable": False,
+                            },
+                            {"name": "Mkt Cap", "id": "market_cap_label", "editable": False},
+                            {
+                                "name": "52W Pos %",
+                                "id": "pos_52w",
+                                "type": "numeric",
+                                "format": {"specifier": ".1f"},
+                                "editable": False,
+                            },
+                            {
+                                "name": "From 50W %",
+                                "id": "dist_50w",
+                                "type": "numeric",
+                                "format": {"specifier": "+.2f"},
+                                "editable": False,
+                            },
+                            {
+                                "name": "From 200W %",
+                                "id": "dist_200w",
+                                "type": "numeric",
+                                "format": {"specifier": "+.2f"},
+                                "editable": False,
+                            },
+                            {
+                                "name": "Status",
+                                "id": "status",
+                                "presentation": "dropdown",
+                                "editable": True,
+                            },
+                            {"name": "Tags", "id": "tags", "editable": True},
+                            {"name": "Notes", "id": "notes", "editable": True},
+                            {"name": "Alerts", "id": "alerts", "editable": False},
+                            {"name": "Added", "id": "date_added", "editable": False},
+                            {"name": "Last Px", "id": "last_price_at", "editable": False},
+                        ],
+                        data=[],
+                        editable=True,
+                        sort_action="native",
+                        filter_action="native",
+                        row_selectable="multi",
+                        selected_rows=[],
+                        page_action="none",
+                        # Persist sort/filter across re-renders.
+                        persistence=True,
+                        persistence_type="local",
+                        persisted_props=["sort_by", "filter_query"],
+                        style_table={"overflowX": "auto", "maxHeight": 540, "overflowY": "auto"},
+                        style_header={
+                            "background": "#f8fafc",
+                            "fontWeight": 700,
+                            "fontSize": 12,
+                            "color": "#101828",
+                            "borderBottom": "1px solid #e4e7ec",
+                        },
+                        style_cell={
+                            "fontSize": 12,
+                            "padding": "6px 8px",
+                            "fontFamily": "inherit",
+                            "textAlign": "left",
+                            "maxWidth": 180,
+                            "whiteSpace": "normal",
+                            "overflow": "hidden",
+                            "textOverflow": "ellipsis",
+                        },
+                        style_data_conditional=[
+                            {
+                                "if": {"filter_query": "{change_pct} > 0", "column_id": "change_pct"},
+                                "color": "#1a7f37",
+                            },
+                            {
+                                "if": {"filter_query": "{change_pct} < 0", "column_id": "change_pct"},
+                                "color": "#b42318",
+                            },
+                            {
+                                "if": {"filter_query": "{alert_count} > 0", "column_id": "alerts"},
+                                "backgroundColor": "#fef3c7",
+                                "color": "#92400e",
+                                "fontWeight": 600,
+                            },
+                            *[
+                                {
+                                    "if": {
+                                        "filter_query": f"{{status}} = {status}",
+                                        "column_id": "status",
+                                    },
+                                    "backgroundColor": WATCHLIST_STATUS_COLORS[status]["bg"],
+                                    "color": WATCHLIST_STATUS_COLORS[status]["fg"],
+                                }
+                                for status in WATCHLIST_STATUSES
                             ],
-                            style=CARD_STYLE,
-                        ),
-                    ],
-                    style=LEFT_CONTENT_COLUMN_STYLE,
-                ),
-                html.Div(
-                    [
-                        dcc.Store(
-                            id="promising-store",
-                            data={"status": "loading", "message": "Loading promising stocks...", "items": []},
-                        ),
-                        dcc.Store(
-                            id="near-200w-store",
-                            data={"status": "loading", "message": "Scanning for tickers near the 200-week moving average...", "items": []},
-                        ),
-                        dcc.Store(
-                            id="below-50w-store",
-                            data={"status": "loading", "message": "Scanning for tickers below the 50-week moving average...", "items": []},
-                        ),
-                        html.Div(
-                            [
-                                html.H3("Promising stocks", style={"marginTop": 0}),
-                                html.Div(
-                                    id="promising-stocks",
-                                    children=html.Div("Loading promising stocks...", style=PANEL_MESSAGE_STYLE),
+                        ],
+                        dropdown={
+                            "status": {
+                                "options": [
+                                    {"label": WATCHLIST_STATUS_LABELS[s], "value": s}
+                                    for s in WATCHLIST_STATUSES
+                                ]
+                            }
+                        },
+                        tooltip_data=[],
+                    ),
+                ],
+                style={**CARD_STYLE, "padding": 10},
+                className="card watchlist-table-card",
+            ),
+            html.Div(
+                id="wl-alerts-panel",
+                children=_render_alerts_panel(initial_watchlist),
+                className="watchlist-alerts-host",
+            ),
+            # ── Overview section ────────────────────────────────────────
+            html.Div(
+                [
+                    html.H2("Overview", style=SECTION_TITLE_STYLE),
+                    html.Div(
+                        "Snapshot and revenue for the primary ticker.",
+                        style=SECTION_HINT_STYLE,
+                    ),
+                ],
+                style=SECTION_HEADER_STYLE,
+                className="section-header",
+            ),
+            html.Div(
+                [
+                    html.Div(
+                        [
+                            html.Div(
+                                [
+                                    html.H3("Company Snapshot", style={"marginTop": 0, "marginBottom": 6}),
+                                    html.Div(
+                                        [
+                                            html.Span("Primary", style=PRIMARY_LABEL_STYLE),
+                                            html.Button(
+                                                "★ In watch list",
+                                                id="wl-favorite-primary",
+                                                n_clicks=0,
+                                                style=FAVORITE_BUTTON_FILLED_STYLE,
+                                                title="Remove this ticker from your watch list",
+                                            ),
+                                        ],
+                                        style={"display": "flex", "alignItems": "center", "gap": 6, "flexWrap": "wrap"},
+                                    ),
+                                ],
+                                style={
+                                    "display": "flex",
+                                    "alignItems": "center",
+                                    "justifyContent": "space-between",
+                                    "gap": 8,
+                                    "flexWrap": "wrap",
+                                    "marginBottom": 6,
+                                },
+                            ),
+                            html.Div(id="company-name", style={"fontWeight": 600}),
+                            html.Div(id="company-meta", style={"color": "#666", "marginBottom": 6}),
+                            html.Div(id="company-cap", style={"marginBottom": 10}),
+                            html.Div("About:", style={"fontWeight": 600, "marginTop": 6}),
+                            html.Div(id="company-about", style={"whiteSpace": "pre-wrap"}),
+                        ],
+                        style=CARD_STYLE,
+                        className="card overview-card snapshot-card",
+                    ),
+                    html.Div(
+                        [
+                            html.Div(
+                                [
+                                    html.H3(
+                                        "Company Financials",
+                                        style={"marginTop": 0, "marginBottom": 6},
+                                    ),
+                                    html.Span("Primary", style=PRIMARY_LABEL_STYLE),
+                                ],
+                                style={
+                                    "display": "flex",
+                                    "alignItems": "center",
+                                    "justifyContent": "space-between",
+                                    "gap": 8,
+                                    "flexWrap": "wrap",
+                                    "marginBottom": 6,
+                                },
+                            ),
+                            html.Div(
+                                [
+                                    html.Div(
+                                        "Revenue from SEC filings with a Yahoo Finance fallback.",
+                                        style=CONTROL_HINT_STYLE,
+                                    ),
+                                    dcc.RadioItems(
+                                        id="financial-period",
+                                        options=[{"label": label, "value": value} for label, value in FINANCIAL_PERIOD_OPTIONS],
+                                        value="quarterly",
+                                        style=RADIO_ITEMS_STYLE,
+                                        labelStyle=RADIO_LABEL_STYLE,
+                                    ),
+                                    html.Div(id="financials-caption", style=CONTROL_HINT_STYLE),
+                                ],
+                                style={"display": "grid", "gap": 8, "marginBottom": 10},
+                            ),
+                            dcc.Loading(
+                                dcc.Graph(
+                                    id="financials-chart",
+                                    figure=make_financials_figure(None, "--", "Quarterly"),
+                                    config={"displaylogo": False, "responsive": True},
+                                    style={"width": "100%"},
                                 ),
-                            ],
-                            style=CARD_STYLE,
-                        ),
-                        html.Div(
-                            [
-                                html.H3("Most Similar Stocks", style={"marginTop": 0}),
-                                html.Div(
+                                type="default",
+                            ),
+                        ],
+                        style=CARD_STYLE,
+                        className="card overview-card financials-card",
+                    ),
+                ],
+                className="overview-grid",
+                style={"display": "grid", "gap": 12},
+            ),
+            # ── Discovery Signals section ───────────────────────────────
+            html.Div(
+                [
+                    html.H2("Discovery Signals", style=SECTION_TITLE_STYLE),
+                    html.Div(
+                        "Find related tickers and screener results. Click any ticker to add it to your watch list.",
+                        style=SECTION_HINT_STYLE,
+                    ),
+                ],
+                style=SECTION_HEADER_STYLE,
+                className="section-header",
+            ),
+            html.Div(
+                [
+                    dcc.Store(
+                        id="promising-store",
+                        data={"status": "loading", "message": "Loading promising stocks...", "items": []},
+                    ),
+                    dcc.Store(
+                        id="near-200w-store",
+                        data={
+                            "status": "loading",
+                            "message": "Scanning for tickers near the 200-week moving average...",
+                            "items": [],
+                        },
+                    ),
+                    dcc.Store(
+                        id="below-50w-store",
+                        data={
+                            "status": "loading",
+                            "message": "Scanning for tickers below the 50-week moving average...",
+                            "items": [],
+                        },
+                    ),
+                    dcc.Tabs(
+                        id="discovery-tabs",
+                        value="similar",
+                        children=[
+                            dcc.Tab(
+                                label="Similar Stocks",
+                                value="similar",
+                                children=html.Div(
                                     id="similar-stocks",
-                                    children=html.Div("Loading similar stocks...", style=PANEL_MESSAGE_STYLE),
+                                    children=html.Div(
+                                        "Loading similar stocks...",
+                                        style=PANEL_MESSAGE_STYLE,
+                                    ),
+                                    style={"padding": "12px 4px 4px"},
                                 ),
-                            ],
-                            style=CARD_STYLE,
-                        ),
-                        html.Div(
-                            [
-                                html.H3("Within 10% of 200-week MA", style={"marginTop": 0}),
-                                html.Div(
+                            ),
+                            dcc.Tab(
+                                label="Promising",
+                                value="promising",
+                                children=html.Div(
+                                    id="promising-stocks",
+                                    children=html.Div(
+                                        "Loading promising stocks...",
+                                        style=PANEL_MESSAGE_STYLE,
+                                    ),
+                                    style={"padding": "12px 4px 4px"},
+                                ),
+                            ),
+                            dcc.Tab(
+                                label="Near 200-week MA",
+                                value="near200w",
+                                children=html.Div(
                                     id="near-200w-ma",
                                     children=html.Div(
                                         "Scanning for tickers near the 200-week moving average...",
                                         style=PANEL_MESSAGE_STYLE,
                                     ),
+                                    style={"padding": "12px 4px 4px"},
                                 ),
-                            ],
-                            style=CARD_STYLE,
-                        ),
-                        html.Div(
-                            [
-                                html.H3("Below 50-week MA", style={"marginTop": 0}),
-                                html.Div(
+                            ),
+                            dcc.Tab(
+                                label="Below 50-week MA",
+                                value="below50w",
+                                children=html.Div(
                                     id="below-50w-ma",
                                     children=html.Div(
                                         "Scanning for tickers below the 50-week moving average...",
                                         style=PANEL_MESSAGE_STYLE,
                                     ),
+                                    style={"padding": "12px 4px 4px"},
                                 ),
-                            ],
-                            style=CARD_STYLE,
-                        ),
-                        dcc.Interval(id="interval-near200w", interval=5_000, n_intervals=0),
-                        dcc.Interval(id="interval-below50w", interval=5_000, n_intervals=0),
-                    ],
-                    style=RIGHT_SIDEBAR_STYLE,
-                ),
-            ],
-            style=MAIN_CONTENT_GRID_STYLE,
-        ),
-    ],
-    style=PAGE_CONTAINER_STYLE,
-)
+                            ),
+                        ],
+                    ),
+                    dcc.Interval(id="interval-near200w", interval=5_000, n_intervals=0),
+                    dcc.Interval(id="interval-below50w", interval=5_000, n_intervals=0),
+                ],
+                style={**CARD_STYLE, "padding": 8},
+                className="card discovery-card",
+            ),
+        ],
+        style=PAGE_CONTAINER_STYLE,
+        className="page-container explorer-page",
+    )
 
 
 def build_stock_clusters_page(pathname: Optional[str]):
@@ -2329,17 +3967,34 @@ def add_clicked_stock_cluster_ticker(click_data, current_selection):
     Input("timeframe", "value"),
     Input("ma-checklist", "value"),
     Input("chart-mode-toggle", "value"),
+    Input("watchlist-store", "data"),
+    Input("wl-compare-toggle", "value"),
     prevent_initial_call=False,
 )
-def update_chart(selected_symbols, timeframe: str, selected_ma: Optional[List[str]], chart_mode_toggle: Optional[List[str]]):
-    symbols = _normalize_symbol_selection(selected_symbols)
+def update_chart(
+    selected_symbols,
+    timeframe: str,
+    selected_ma: Optional[List[str]],
+    chart_mode_toggle: Optional[List[str]],
+    watchlist_data,
+    compare_toggle,
+):
     chart_modes = set(chart_mode_toggle or [])
     normalized = "normalized" in chart_modes
     log_returns = "log" in chart_modes
-    if not symbols:
-        return make_multi_symbol_figure({}, "--", normalized=normalized, log_returns=log_returns)
-
     label = next((lab for lab, val in TIMEFRAMES if val == timeframe), timeframe)
+
+    state = _normalize_watchlist_state(watchlist_data)
+    compare_only = "compare" in (compare_toggle or [])
+
+    if compare_only and state["selected"]:
+        symbols = list(state["selected"])
+    else:
+        symbols = _normalize_symbol_selection(selected_symbols)
+
+    if not symbols:
+        return make_multi_symbol_figure({}, label, normalized=normalized, log_returns=log_returns)
+
     if len(symbols) == 1 and not normalized and not log_returns:
         primary_symbol = symbols[0]
         try:
@@ -2376,6 +4031,27 @@ def update_chart(selected_symbols, timeframe: str, selected_ma: Optional[List[st
 
 
 @app.callback(
+    Output("price-chart-title", "children"),
+    Input("watchlist-store", "data"),
+    Input("wl-compare-toggle", "value"),
+    prevent_initial_call=False,
+)
+def render_price_chart_title(watchlist_data, compare_toggle):
+    state = _normalize_watchlist_state(watchlist_data)
+    if not state["items"]:
+        return "Price Chart"
+    primary = state["primary"] or "--"
+    compare_only = "compare" in (compare_toggle or [])
+    selected = state["selected"] or _watchlist_tickers(state)
+    if compare_only and len(selected) > 1:
+        head = ", ".join(selected[:3])
+        if len(selected) > 3:
+            head += f" +{len(selected) - 3} more"
+        return f"Comparing {len(selected)} (primary: {primary}) — {head}"
+    return f"Primary: {primary}"
+
+
+@app.callback(
     Output("ma-checklist", "options"),
     Output("ma-checklist", "value"),
     Output("ma-control-block", "style"),
@@ -2402,16 +4078,13 @@ def sync_ma_controls(selected_symbols, chart_mode_toggle, selected_ma):
 
 @app.callback(
     Output("price-summary", "children"),
-    Input("ticker", "value"),
+    Input("watchlist-store", "data"),
     Input("timeframe", "value"),
     prevent_initial_call=False,
 )
-def update_price_summary(symbol: str, timeframe: str):
-    selected_symbols = _normalize_symbol_selection(symbol)
-    if len(selected_symbols) > 1:
-        return _build_price_summary_cards({label: "-" for label in SUMMARY_METRICS})
-
-    primary_symbol = _primary_selected_symbol(symbol)
+def update_price_summary(watchlist_data, timeframe: str):
+    watchlist = _normalize_watchlist_state(watchlist_data)
+    primary_symbol = watchlist["primary"]
     if not primary_symbol:
         return _build_price_summary_cards({})
 
@@ -2430,10 +4103,11 @@ def update_price_summary(symbol: str, timeframe: str):
     Output("company-meta", "children"),
     Output("company-cap", "children"),
     Output("company-about", "children"),
-    Input("ticker", "value"),  # triggers when ticker changes
+    Input("watchlist-store", "data"),
 )
-def update_company_info(symbol: str):
-    primary_symbol = _primary_selected_symbol(symbol)
+def update_company_info(watchlist_data):
+    watchlist = _normalize_watchlist_state(watchlist_data)
+    primary_symbol = watchlist["primary"]
     if not primary_symbol:
         return ("--", "Sector: --  |  Industry: --", "Market Cap: --", "Select a ticker to view company information.")
 
@@ -2520,12 +4194,13 @@ def update_company_info(symbol: str):
 @app.callback(
     Output("financials-chart", "figure"),
     Output("financials-caption", "children"),
-    Input("ticker", "value"),
+    Input("watchlist-store", "data"),
     Input("financial-period", "value"),
     prevent_initial_call=False,
 )
-def update_financials_chart(symbol, period: str):
-    primary_symbol = _primary_selected_symbol(symbol)
+def update_financials_chart(watchlist_data, period: str):
+    watchlist = _normalize_watchlist_state(watchlist_data)
+    primary_symbol = watchlist["primary"]
     period_label = "Quarterly" if period == "quarterly" else "Annual"
     if not primary_symbol:
         return make_financials_figure(None, "--", period_label), "Select a ticker to view company revenue."
@@ -2593,11 +4268,12 @@ def build_promising_panel(panel_data):
 
 @app.callback(
     Output("similar-stocks", "children"),
-    Input("ticker", "value"),
+    Input("watchlist-store", "data"),
     prevent_initial_call=False,
 )
-def build_similar_stocks_panel(symbol: str):
-    primary_symbol = _primary_selected_symbol(symbol)
+def build_similar_stocks_panel(watchlist_data):
+    watchlist = _normalize_watchlist_state(watchlist_data)
+    primary_symbol = watchlist["primary"]
     if not primary_symbol:
         return html.Div("Select a ticker to view similar stocks.", style=PANEL_MESSAGE_STYLE)
 
@@ -2863,21 +4539,378 @@ def build_below_50w_panel(ticker_list):
     ], style={"display": "grid", "gap": 4, "maxHeight": 280, "overflowY": "auto"})
 
 
-# Clicking a ticker in any panel updates the dropdown (and thus the chart)
+# ------------------------------------------------------------
+# Unified watchlist state manager.
+# Owns watchlist-store and mirrors changes back to the ticker dropdown.
+# Inputs:
+#   - dropdown changes (user typing/selecting in the search dropdown)
+#   - quick-add input in the watchlist tray
+#   - chip remove / set-primary buttons in the watchlist tray
+#   - "Clear all" → ConfirmDialog → submit_n_clicks
+#   - sidebar "add to watch list" buttons in every discovery panel
+#   - DataTable edits (notes/tags/status changes)
+#   - Alerts editor add/remove
+# ------------------------------------------------------------
 @app.callback(
+    Output("watchlist-store", "data"),
     Output("ticker", "value", allow_duplicate=True),
+    Output("watchlist-quick-add", "value"),
+    Output("watchlist-quick-add-feedback", "children"),
+    Input("ticker", "value"),
+    Input({"type": "wl-remove", "index": ALL}, "n_clicks"),
+    Input({"type": "wl-primary", "index": ALL}, "n_clicks"),
+    Input("wl-clear-confirm", "submit_n_clicks"),
+    Input("watchlist-quick-add-btn", "n_clicks"),
+    Input("watchlist-quick-add", "n_submit"),
     Input({"type": "ticker-select-promising", "index": ALL}, "n_clicks"),
     Input({"type": "ticker-select-similar", "index": ALL}, "n_clicks"),
     Input({"type": "ticker-select-near200w", "index": ALL}, "n_clicks"),
     Input({"type": "ticker-select-below50w", "index": ALL}, "n_clicks"),
+    Input("watchlist-table", "data_timestamp"),
+    Input("wl-alert-add", "n_clicks"),
+    Input({"type": "wl-alert-remove", "index": ALL}, "n_clicks"),
+    Input("wl-favorite-primary", "n_clicks"),
+    State("watchlist-store", "data"),
+    State("watchlist-quick-add", "value"),
+    State("watchlist-table", "data"),
+    State("wl-alert-type", "value"),
+    State("wl-alert-value", "value"),
+    State("wl-alert-note", "value"),
     prevent_initial_call=True,
 )
-def set_ticker_from_panel(_promising_clicks, _similar_clicks, _near200w_clicks, _below50w_clicks):
-    if not ctx.triggered_id or not ctx.triggered:
+def manage_watchlist(
+    dropdown_value,
+    _wl_remove_clicks,
+    _wl_primary_clicks,
+    _confirm_clear_clicks,
+    _quick_add_clicks,
+    _quick_add_submit,
+    _prom_clicks,
+    _sim_clicks,
+    _near200_clicks,
+    _below50_clicks,
+    _table_data_ts,
+    _alert_add_clicks,
+    _alert_remove_clicks,
+    _favorite_clicks,
+    watchlist_data,
+    quick_add_value,
+    table_data,
+    alert_type,
+    alert_value,
+    alert_note,
+):
+    state = _normalize_watchlist_state(watchlist_data)
+    triggered = ctx.triggered_id
+    if triggered is None:
+        return dash.no_update, dash.no_update, dash.no_update, dash.no_update
+
+    sidebar_types = {
+        "ticker-select-promising",
+        "ticker-select-similar",
+        "ticker-select-near200w",
+        "ticker-select-below50w",
+    }
+
+    feedback_msg: object = dash.no_update
+    new_quick_add: object = dash.no_update
+    new_state = state
+
+    if triggered == "ticker":
+        new_state = _watchlist_replace_tickers(state, dropdown_value)
+
+    elif triggered == "wl-clear-confirm":
+        # ConfirmDialog only fires submit_n_clicks when the user confirms.
+        new_state = _empty_watchlist_state()
+
+    elif triggered in {"watchlist-quick-add-btn", "watchlist-quick-add"}:
+        symbol = str(quick_add_value or "").strip().upper()
+        if not symbol:
+            return dash.no_update, dash.no_update, dash.no_update, "Type a ticker symbol first."
+        if not symbol.replace(".", "").replace("-", "").isalnum():
+            return dash.no_update, dash.no_update, dash.no_update, f"'{symbol}' is not a valid ticker symbol."
+        if symbol in _watchlist_tickers(state):
+            new_state = _watchlist_set_primary(state, symbol)
+            feedback_msg = f"{symbol} is already in your watch list (set as primary)."
+            new_quick_add = ""
+        else:
+            new_state = _watchlist_add(state, symbol)
+            feedback_msg = f"Added {symbol} to your watch list."
+            new_quick_add = ""
+
+    elif triggered == "watchlist-table":
+        # The DataTable editable cells round-trip through this branch.
+        return _apply_table_edits(state, table_data)
+
+    elif triggered == "wl-alert-add":
+        if not _has_real_click(ctx.triggered[0].get("value")):
+            return dash.no_update, dash.no_update, dash.no_update, dash.no_update
+        primary = state["primary"]
+        if not primary:
+            return dash.no_update, dash.no_update, dash.no_update, dash.no_update
+        atype = str(alert_type or "").strip().lower()
+        if atype not in WATCHLIST_ALERT_TYPES:
+            return dash.no_update, dash.no_update, dash.no_update, dash.no_update
+        # Crossover alerts don't require a numeric value.
+        try:
+            value = float(alert_value) if alert_value is not None and alert_value != "" else None
+        except (TypeError, ValueError):
+            value = None
+        item = _watchlist_get_item(state, primary)
+        existing_alerts = list((item or {}).get("alerts") or [])
+        existing_alerts.append({"type": atype, "value": value, "note": alert_note or ""})
+        new_state = _watchlist_update_item(state, primary, alerts=existing_alerts)
+
+    elif triggered == "wl-favorite-primary":
+        # Star button on the snapshot card. The snapshot always shows the
+        # primary, which is by definition in the watch list, so a click here
+        # is always a "remove from watch list" action for that ticker.
+        if not _has_real_click(ctx.triggered[0].get("value")):
+            return dash.no_update, dash.no_update, dash.no_update, dash.no_update
+        primary = state["primary"]
+        if not primary:
+            return dash.no_update, dash.no_update, dash.no_update, dash.no_update
+        new_state = _watchlist_remove(state, primary)
+
+    elif isinstance(triggered, dict):
+        ttype = triggered.get("type")
+        index = triggered.get("index")
+        if ttype == "wl-alert-remove":
+            primary = state["primary"]
+            if not primary or not _has_real_click(ctx.triggered[0].get("value")):
+                return dash.no_update, dash.no_update, dash.no_update, dash.no_update
+            item = _watchlist_get_item(state, primary) or {}
+            alerts = list(item.get("alerts") or [])
+            try:
+                position = int(index)
+            except (TypeError, ValueError):
+                return dash.no_update, dash.no_update, dash.no_update, dash.no_update
+            if 0 <= position < len(alerts):
+                alerts.pop(position)
+                new_state = _watchlist_update_item(state, primary, alerts=alerts)
+            else:
+                return dash.no_update, dash.no_update, dash.no_update, dash.no_update
+        else:
+            if not _has_real_click(ctx.triggered[0].get("value")):
+                return dash.no_update, dash.no_update, dash.no_update, dash.no_update
+            if ttype == "wl-remove":
+                new_state = _watchlist_remove(state, index)
+            elif ttype == "wl-primary":
+                new_state = _watchlist_set_primary(state, index)
+            elif ttype in sidebar_types:
+                symbol = str(index or "").strip().upper()
+                if symbol in _watchlist_tickers(state):
+                    new_state = _watchlist_set_primary(state, symbol)
+                else:
+                    new_state = _watchlist_add(
+                        state, symbol, set_primary=not state["items"]
+                    )
+            else:
+                return dash.no_update, dash.no_update, dash.no_update, dash.no_update
+    else:
+        return dash.no_update, dash.no_update, dash.no_update, dash.no_update
+
+    if new_state == state:
+        return dash.no_update, dash.no_update, new_quick_add, feedback_msg
+
+    new_tickers = _watchlist_tickers(new_state)
+    old_tickers = _watchlist_tickers(state)
+    dropdown_update = list(new_tickers) if new_tickers != old_tickers else dash.no_update
+    return new_state, dropdown_update, new_quick_add, feedback_msg
+
+
+def _apply_table_edits(state, table_data):
+    """Convert an edited DataTable back into a watchlist-state update."""
+    if not isinstance(table_data, list):
+        return dash.no_update, dash.no_update, dash.no_update, dash.no_update
+    new_state = _normalize_watchlist_state(state)
+    changed = False
+    for row in table_data:
+        if not isinstance(row, dict):
+            continue
+        ticker = str(row.get("ticker") or "").strip().upper()
+        if not ticker:
+            continue
+        item = _watchlist_get_item(new_state, ticker)
+        if item is None:
+            continue
+        new_notes = str(row.get("notes") or "").strip()
+        new_tags = _normalize_tags(row.get("tags"))
+        new_status = str(row.get("status") or item.get("status") or WATCHLIST_DEFAULT_STATUS).strip().lower()
+        if new_status not in WATCHLIST_STATUSES:
+            new_status = item.get("status") or WATCHLIST_DEFAULT_STATUS
+        if (
+            new_notes != (item.get("notes") or "")
+            or new_tags != (item.get("tags") or [])
+            or new_status != item.get("status")
+        ):
+            new_state = _watchlist_update_item(
+                new_state,
+                ticker,
+                notes=new_notes,
+                tags=new_tags,
+                status=new_status,
+            )
+            changed = True
+    if not changed:
+        return dash.no_update, dash.no_update, dash.no_update, dash.no_update
+    return new_state, dash.no_update, dash.no_update, dash.no_update
+
+
+# ------------------------------------------------------------
+# Tray + summary + alerts re-render whenever the watchlist changes.
+# ------------------------------------------------------------
+@app.callback(
+    Output("watchlist-tray", "children"),
+    Input("watchlist-store", "data"),
+    prevent_initial_call=False,
+)
+def render_watchlist_tray_cb(watchlist_data):
+    return _render_watchlist_tray(watchlist_data)
+
+
+@app.callback(
+    Output("wl-favorite-primary", "children"),
+    Output("wl-favorite-primary", "style"),
+    Output("wl-favorite-primary", "title"),
+    Output("wl-favorite-primary", "disabled"),
+    Input("watchlist-store", "data"),
+    prevent_initial_call=False,
+)
+def render_favorite_button(watchlist_data):
+    state = _normalize_watchlist_state(watchlist_data)
+    primary = state["primary"]
+    if not primary:
+        return (
+            "☆ Add to watch list",
+            FAVORITE_BUTTON_EMPTY_STYLE,
+            "Use the search or quick-add to set a primary ticker first",
+            True,
+        )
+    return (
+        f"★ {primary} saved",
+        FAVORITE_BUTTON_FILLED_STYLE,
+        f"Click to remove {primary} from your watch list",
+        False,
+    )
+
+
+@app.callback(
+    Output("watchlist-summary", "children"),
+    Input("watchlist-store", "data"),
+    Input("wl-table-rows", "data"),
+    prevent_initial_call=False,
+)
+def render_daily_summary_cb(watchlist_data, table_rows):
+    return _render_daily_change_summary(watchlist_data, rows=table_rows)
+
+
+@app.callback(
+    Output("wl-alerts-panel", "children"),
+    Input("watchlist-store", "data"),
+    Input("wl-refresh", "n_intervals"),
+    prevent_initial_call=False,
+)
+def render_alerts_panel_cb(watchlist_data, _n_intervals):
+    return _render_alerts_panel(watchlist_data)
+
+
+# ------------------------------------------------------------
+# Watchlist table data: recomputed when the watchlist changes or the
+# refresh interval ticks. The intermediate Store powers the daily
+# summary panel without having to recompute metrics twice.
+# ------------------------------------------------------------
+@app.callback(
+    Output("wl-table-rows", "data"),
+    Input("watchlist-store", "data"),
+    Input("wl-refresh", "n_intervals"),
+    prevent_initial_call=False,
+)
+def recompute_table_rows(watchlist_data, _n_intervals):
+    return _build_watchlist_table_rows(watchlist_data)
+
+
+@app.callback(
+    Output("watchlist-table", "data"),
+    Output("wl-table-count", "children"),
+    Input("wl-table-rows", "data"),
+    Input("wl-status-filter", "value"),
+    Input("wl-tag-filter", "value"),
+    prevent_initial_call=False,
+)
+def render_watchlist_table_cb(rows, status_filter, tag_filter):
+    rows = rows or []
+    filtered = list(rows)
+    if status_filter and status_filter != "__all__":
+        filtered = [r for r in filtered if r.get("status") == status_filter]
+    if tag_filter:
+        wanted = {t.strip().lower() for t in str(tag_filter).split(",") if t.strip()}
+        if wanted:
+            def _row_tag_set(row):
+                raw = str(row.get("tags") or "")
+                return {t.strip().lower() for t in raw.split(",") if t.strip()}
+            filtered = [r for r in filtered if wanted & _row_tag_set(r)]
+    count_label = (
+        f"{len(filtered)} of {len(rows)} ticker{'s' if len(rows) != 1 else ''}"
+        if rows
+        else "Watch list is empty."
+    )
+    return filtered, count_label
+
+
+# Sync the DataTable's selected_rows ↔ watchlist.selected so compare mode
+# can drive the chart from the table checkboxes.
+@app.callback(
+    Output("watchlist-store", "data", allow_duplicate=True),
+    Input("watchlist-table", "selected_rows"),
+    State("watchlist-table", "data"),
+    State("watchlist-store", "data"),
+    prevent_initial_call=True,
+)
+def sync_selected_from_table(selected_rows, table_data, watchlist_data):
+    if not isinstance(table_data, list):
         return dash.no_update
-    if not _has_real_click(ctx.triggered[0].get("value")):
+    state = _normalize_watchlist_state(watchlist_data)
+    if not state["items"]:
         return dash.no_update
-    return [ctx.triggered_id["index"]]
+    selected_rows = selected_rows or []
+    selected_tickers = []
+    for idx in selected_rows:
+        if isinstance(idx, int) and 0 <= idx < len(table_data):
+            sym = str((table_data[idx] or {}).get("ticker") or "").strip().upper()
+            if sym:
+                selected_tickers.append(sym)
+    new_state = _watchlist_set_selected(state, selected_tickers or _watchlist_tickers(state))
+    if new_state["selected"] == state["selected"]:
+        return dash.no_update
+    return new_state
+
+
+# Open the confirm dialog when the user clicks "Clear all".
+@app.callback(
+    Output("wl-clear-confirm", "displayed"),
+    Input("wl-clear-all", "n_clicks"),
+    prevent_initial_call=True,
+)
+def open_clear_confirm(n_clicks):
+    return bool(n_clicks)
+
+
+# When session-persisted watchlist data is loaded on page mount, push the
+# restored ticker list into the dropdown so the chart matches the tray.
+@app.callback(
+    Output("ticker", "value", allow_duplicate=True),
+    Input("watchlist-store", "data"),
+    State("ticker", "value"),
+    prevent_initial_call="initial_duplicate",
+)
+def sync_dropdown_from_watchlist(watchlist_data, current_value):
+    state = _normalize_watchlist_state(watchlist_data)
+    current = _normalize_symbol_selection(current_value)
+    new_tickers = _watchlist_tickers(state)
+    if new_tickers == current:
+        return dash.no_update
+    return list(new_tickers)
 
 # ------------------------------------------------------------
 # YOUR DATA FUNCTIONS — replace these stubs
